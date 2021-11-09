@@ -15,29 +15,33 @@ APPEND_ENTRY_RESPONSE = "APPEND_ENTRY_RESPONSE"
 
 
 class VoteRequest:
-    def __init__(self, term, candidate_id,
+    def __init__(self, sender_id, term, candidate_id,
                  last_log_index, last_log_term):
+        self.sender = sender_id
         self.term = term
         self.candidate_id = candidate_id
         self.last_log_index = last_log_index
         self.last_log_term = last_log_term
 
     def __repr__(self):
-        return "{}:{}:{}:{}:{}".format(VOTE_REQUEST_TYPE,
-                                       self.term,
-                                       self.candidate_id,
-                                       self.last_log_index,
-                                       self.last_log_term)
+        return "{}:{}:{}:{}:{}:{}".format(VOTE_REQUEST_TYPE,
+                                          self.sender,
+                                          self.term,
+                                          self.candidate_id,
+                                          self.last_log_index,
+                                          self.last_log_term)
 
 
 class VoteResponse:
-    def __init__(self, term, granted):
+    def __init__(self, sender, term, granted):
+        self.sender = sender
         self.term = term
         self.granted = granted
 
     def __repr__(self):
-        return "{}:{}:{}".format(VOTE_RESPONSE_TYPE,
-                                 self.term, self.granted)
+        return "{}:{}:{}:{}".format(VOTE_RESPONSE_TYPE,
+                                    self.sender, self.term,
+                                    self.granted)
 
 
 class Entry:
@@ -50,16 +54,16 @@ class Entry:
 class AppendEntryRequest:
     def __init__(self, term, leader_id, prev_log_index,
                  entries, leader_commit_index):
-        self.term = term
         self.leader_id = leader_id
+        self.term = term
         self.prev_log_index = prev_log_index
         self.entries = entries
         self.leader_commit_index = leader_commit_index
 
     def __repr__(self):
         return "{}:{}:{}:{}:{}:{}:{}".format(APPEND_ENTRY_REQUEST,
-                                             self.term,
                                              self.leader_id,
+                                             self.term,
                                              self.prev_log_index,
                                              len(self.entries),
                                              self.entries,
@@ -67,13 +71,15 @@ class AppendEntryRequest:
 
 
 class AppendEntryResponse:
-    def __init__(self, term, success):
+    def __init__(self, sender, term, success):
+        self.sender = sender
         self.term = term
         self.success = success
 
     def __repr__(self):
-        return "{}:{}:{}".format(APPEND_ENTRY_RESPONSE,
-                                 self.term, self.success)
+        return "{}:{}:{}:{}".format(APPEND_ENTRY_RESPONSE,
+                                    self.sender,
+                                    self.term, self.success)
 
 
 class RpcHandler(socketserver.StreamRequestHandler):
@@ -83,19 +89,21 @@ class RpcHandler(socketserver.StreamRequestHandler):
         data_str = data.decode('utf-8')
         fields = data_str.split(":")
         type_str = fields[0]
+        sender = fields[1]
+        logging.info("Type: %s, sender: node %s", type_str, sender)
         try:
             if type_str == VOTE_REQUEST_TYPE:
                 # According to TcpServer implementation, self.server
                 # in BaseRequestHandler will be instance of TcpServer.
                 # As in this case, it is Node instance.
-                self.server.process_vote_request(self.wfile, fields)
+                self.server.process_vote_request(fields)
             elif type_str == VOTE_RESPONSE_TYPE:
                 self.server.process_vote_response(self.wfile, fields)
         except:
             logging.exception("Failed to process %s", fields)
 
 
-class Node(socketserver.TCPServer):
+class Node(socketserver.ThreadingTCPServer):
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 2
@@ -114,46 +122,75 @@ class Node(socketserver.TCPServer):
         self._log_entries = []
         self._commit_index = 0
         self._last_applied = -1
-        self._peers = neighbors
+        self._peers = {}
+        self._granted = 0
+        for peer in neighbors:
+            # neighbors passed in is a id,ip,port tuple
+            # _peers is a dict with key=id, value=(ip, port)
+            self._peers[peer[0]] = (peer[1], int(peer[2]))
         self._timer = threading.Timer(
             random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
             self.leader_elect_timeout_handler)
         self._timer.start()
 
-    def process_vote_request(self, out_file, msg_fields):
+    def process_vote_request(self, msg_fields):
         term_in_request = int(msg_fields[1])
-        resp = VoteResponse(-1, 0)
+        resp = VoteResponse(self._id, -1, 0)
         term_in_log = self._log_entries[-1].term if self._log_entries else -1
         last_log_index = len(self._log_entries) - 1
+        logging.info("Process vote request: %s", msg_fields)
         if term_in_request < self._cur_term:
             resp_msg = '%s' % resp
-            out_file.write(resp_msg.encode('utf-8'))
         else:
             if self._vote_for is None and \
                     (int(msg_fields[4]) > term_in_log or
                      (int(msg_fields[4]) == term_in_log and
                       int(msg_fields[3]) >= last_log_index)):
                 resp.granted = 1
+                self._vote_for = int(msg_fields[1])
                 resp.term = int(msg_fields[4])
                 resp_msg = '%s' % resp
-                out_file.write(resp_msg.encode('utf-8'))
             else:
                 resp_msg = '%s' % resp
-                out_file.write(resp_msg.encode('utf-8'))
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                peer_id = int(msg_fields[1])
+                if peer_id not in self._peers:
+                    logging.error("Unknown node %s", peer_id)
+                    return
+                peer_ip, peer_port = self._peers[peer_id]
+                logging.info("Send vote response message: %s to node %s"
+                             " with address %s",
+                             resp_msg, peer_id, (peer_ip, peer_port))
+                s.connect((peer_ip, peer_port))
+                s.sendall(resp_msg.encode('utf-8'))
+            except:
+                logging.exception("Failed to send response to node %s",
+                                  peer_id)
 
     def process_vote_response(self, out_file, msg_fields):
-        granted_count = 0
         logging.info("Vote response: %s", msg_fields)
-        _, _, granted = msg_fields
+        _, _, _, granted = msg_fields
         if int(granted):
-            granted_count += 1
-        if granted_count > len(self._peers) / 2:
+            self._granted += 1
+        logging.info("Granted me as leader: %s", self._granted)
+        if self._granted > len(self._peers) / 2:
             # Win election, change role to leader
             self._role = Node.LEADER
+            logging.info("I am the leader")
             # Start to send AppendEntriesRequest to peer nodes
+            last_log_index = len(self._log_entries) - 1
+            rpc_msg = AppendEntryRequest(self._cur_term, self._id,
+                                         last_log_index, [],
+                                         self._commit_index)
 
     def leader_elect_timeout_handler(self):
+        logging.info("Start a new vote cycle for term: %s",
+                     self._cur_term)
         self._role = self.CANDIDATE
+        self._vote_for = None
+        self._granted = 0
+        self._cur_term += 1
         self.request_vote()
         self._timer.cancel()
         self._timer = threading.Timer(
@@ -162,35 +199,40 @@ class Node(socketserver.TCPServer):
         self._timer.start()
 
     def request_vote(self):
-        self._cur_term += 1
         last_log_index = len(self._log_entries) - 1
         if last_log_index > -1:
             last_log_term = self._log_entries[last_log_index].term
         else:
             last_log_term = 0
-        rpc_message = '%s' % VoteRequest(self._cur_term, self._id,
+        rpc_message = '%s' % VoteRequest(self._id, self._cur_term, self._id,
                                          last_log_index,
                                          last_log_term)
-        if self._peers is None:
+        if not self._peers:
             self._role = Node.LEADER
         else:
-            for peer_ip, peer_port in self._peers:
+            for peer_id, peer_addr in self._peers.items():
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     try:
-                        logging.info("Send vote request message: %s to %s:%s",
-                                     rpc_message, peer_ip, peer_port)
-                        s.connect((peer_ip, int(peer_port)))
+                        logging.info("Send vote request message: %s to node %s"
+                                     " with address %s",
+                                     rpc_message, peer_id, peer_addr )
+                        s.connect((peer_addr[0], peer_addr[1]))
                         s.sendall(rpc_message.encode('utf-8'))
                     except:
-                        logging.exception("Failed to communicate with %s:%s",
-                                          peer_ip, peer_port)
+                        logging.exception("Failed to communicate with node %s"
+                                          " with address %s",
+                                          peer_id, peer_addr)
 
-    def add_peer(self, peer_ip, peer_port):
-        self._peers.append((peer_ip, peer_port))
+    def add_peer(self, peer_id, peer_ip, peer_port):
+        self._peers[peer_id] = (peer_ip, peer_port)
 
     def append_log(self):
         logging.info("Append logs: %s", self._log_entries)
         self._timer.cancel()
+        self._timer = threading.Timer(
+            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
+            self.leader_elect_timeout_handler)
+        self._timer.start()
         # Update its own term with the term in the AppendLogRequest
 
 
@@ -213,6 +255,7 @@ if __name__ == "__main__":
     node_port = int(config[section_name]['port'])
     node_peers = config[section_name]['peers'].split(',')
     peers = [p.split(':') for p in node_peers]
+    peers = [(int(p[0]), p[1], p[2]) for p in peers]
 
     logging.basicConfig(
         handlers=[RotatingFileHandler(
