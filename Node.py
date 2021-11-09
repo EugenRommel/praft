@@ -1,8 +1,10 @@
 import argparse
 import configparser
 import logging
+import random
 import socket
 import socketserver
+import threading
 
 from logging.handlers import RotatingFileHandler
 
@@ -75,23 +77,30 @@ class AppendEntryResponse:
 
 
 class RpcHandler(socketserver.StreamRequestHandler):
-    def handle(self) -> None:
+    def handle(self):
         data = self.rfile.readline().strip()
         logging.info("Received %s from %s", data, self.client_address)
         data_str = data.decode('utf-8')
         fields = data_str.split(":")
         type_str = fields[0]
-        if type_str == VOTE_REQUEST_TYPE:
-            # According to TcpServer implementation, self.server
-            # in BaseRequestHandler will be instance of TcpServer.
-            # As in this case, it is Node instance.
-            self.server.process_vote_request(fields)
+        try:
+            if type_str == VOTE_REQUEST_TYPE:
+                # According to TcpServer implementation, self.server
+                # in BaseRequestHandler will be instance of TcpServer.
+                # As in this case, it is Node instance.
+                self.server.process_vote_request(self.wfile, fields)
+            elif type_str == VOTE_RESPONSE_TYPE:
+                self.server.process_vote_response(self.wfile, fields)
+        except:
+            logging.exception("Failed to process %s", fields)
 
 
 class Node(socketserver.TCPServer):
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 2
+    ELECTION_TIME_LOW = 1
+    ELECTION_TIME_HIGH = 10
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True,
                  role=FOLLOWER, node_id=0, neighbors=None):
@@ -106,24 +115,54 @@ class Node(socketserver.TCPServer):
         self._commit_index = 0
         self._last_applied = -1
         self._peers = neighbors
+        self._timer = threading.Timer(
+            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
+            self.leader_elect_timeout_handler)
+        self._timer.start()
 
     def process_vote_request(self, out_file, msg_fields):
         term_in_request = int(msg_fields[1])
-        resp = VoteResponse(-1, False)
+        resp = VoteResponse(-1, 0)
+        term_in_log = self._log_entries[-1].term if self._log_entries else -1
+        last_log_index = len(self._log_entries) - 1
         if term_in_request < self._cur_term:
             resp_msg = '%s' % resp
             out_file.write(resp_msg.encode('utf-8'))
         else:
             if self._vote_for is None and \
-                    (int(msg_fields[4]) > self._log_entries[-1].term or
-                     (int(msg_fields[4]) == self._log_entries[-1].term and
-                      int(msg_fields[3]) > len(self._log_entries) - 1)):
-                resp.granted = True
+                    (int(msg_fields[4]) > term_in_log or
+                     (int(msg_fields[4]) == term_in_log and
+                      int(msg_fields[3]) >= last_log_index)):
+                resp.granted = 1
                 resp.term = int(msg_fields[4])
                 resp_msg = '%s' % resp
                 out_file.write(resp_msg.encode('utf-8'))
+            else:
+                resp_msg = '%s' % resp
+                out_file.write(resp_msg.encode('utf-8'))
+
+    def process_vote_response(self, out_file, msg_fields):
+        granted_count = 0
+        logging.info("Vote response: %s", msg_fields)
+        _, _, granted = msg_fields
+        if int(granted):
+            granted_count += 1
+        if granted_count > len(self._peers) / 2:
+            # Win election, change role to leader
+            self._role = Node.LEADER
+            # Start to send AppendEntriesRequest to peer nodes
+
+    def leader_elect_timeout_handler(self):
+        self._role = self.CANDIDATE
+        self.request_vote()
+        self._timer.cancel()
+        self._timer = threading.Timer(
+            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
+            self.leader_elect_timeout_handler)
+        self._timer.start()
 
     def request_vote(self):
+        self._cur_term += 1
         last_log_index = len(self._log_entries) - 1
         if last_log_index > -1:
             last_log_term = self._log_entries[last_log_index].term
@@ -132,29 +171,27 @@ class Node(socketserver.TCPServer):
         rpc_message = '%s' % VoteRequest(self._cur_term, self._id,
                                          last_log_index,
                                          last_log_term)
-        logging.info("Request vote: %s", rpc_message)
-        granted_count = 0
         if self._peers is None:
             self._role = Node.LEADER
         else:
             for peer_ip, peer_port in self._peers:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.connect((peer_ip, peer_port))
-                    s.sendall(rpc_message.encode('utf-8'))
-                    data = s.recv(1024)
-                    resp_msg = data.decode('utf-8')
-                    _, _, granted = resp_msg.split(":")
-                    if granted:
-                        granted_count += 1
-            if granted_count > len(self._peers) / 2:
-                # Win election, change role to leader
-                self._role = Node.LEADER
+                    try:
+                        logging.info("Send vote request message: %s to %s:%s",
+                                     rpc_message, peer_ip, peer_port)
+                        s.connect((peer_ip, int(peer_port)))
+                        s.sendall(rpc_message.encode('utf-8'))
+                    except:
+                        logging.exception("Failed to communicate with %s:%s",
+                                          peer_ip, peer_port)
 
     def add_peer(self, peer_ip, peer_port):
         self._peers.append((peer_ip, peer_port))
 
     def append_log(self):
         logging.info("Append logs: %s", self._log_entries)
+        self._timer.cancel()
+        # Update its own term with the term in the AppendLogRequest
 
 
 if __name__ == "__main__":
@@ -179,9 +216,9 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         handlers=[RotatingFileHandler(
-            'raft.log', maxBytes=20 * 1024 * 1024, backupCount=10)],
+            'Node%d.log' %args.node, maxBytes=20 * 1024 * 1024, backupCount=10)],
         level=logging.DEBUG,
-        format="[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+        format="[%(asctime)s] %(levelname)s [%(funcName)s] %(message)s",
         datefmt='%Y-%m-%dT%H:%M:%S')
 
     logging.info("Node run on %s:%s with id %s", node_ip, node_port, args.node)
