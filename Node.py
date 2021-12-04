@@ -2,16 +2,16 @@ import argparse
 import configparser
 import logging
 import random
+import signal
 import socket
 import socketserver
 import threading
 
 from logging.handlers import RotatingFileHandler
-
-VOTE_REQUEST_TYPE = "VOTE_REQUEST"
-VOTE_RESPONSE_TYPE = "VOTE_RESPONSE"
-APPEND_ENTRY_REQUEST = "APPEND_ENTRY_REQUEST"
-APPEND_ENTRY_RESPONSE = "APPEND_ENTRY_RESPONSE"
+from Common import VOTE_REQUEST_TYPE, VOTE_RESPONSE_TYPE, \
+    APPEND_ENTRY_REQUEST, APPEND_ENTRY_RESPONSE, \
+    CLIENT_COMMAND_REQUEST, CLIENT_COMMAND_RESPONSE, \
+    CLIEN_SUBCOMMAND_QURERY_LEADER
 
 
 class VoteRequest:
@@ -87,6 +87,17 @@ class AppendEntryResponse:
                                     self.term, self.success)
 
 
+class QueryLeaderResponse:
+    def __init__(self, leader, success):
+        self.leader = leader
+        self.success = success
+
+    def __repr__(self):
+        return "{}:{}:{}".format(CLIENT_COMMAND_RESPONSE,
+                                 CLIEN_SUBCOMMAND_QURERY_LEADER,
+                                 self.leader, self.success)
+
+
 class RpcHandler(socketserver.StreamRequestHandler):
     def handle(self):
         data = self.rfile.readline().strip()
@@ -104,7 +115,15 @@ class RpcHandler(socketserver.StreamRequestHandler):
                 self.server.process_vote_request(fields)
             elif type_str == VOTE_RESPONSE_TYPE:
                 self.server.process_vote_response(fields)
-        except:
+            elif type_str == APPEND_ENTRY_REQUEST:
+                self.server.process_append_entries_request(fields)
+            elif type_str == APPEND_ENTRY_RESPONSE:
+                self.server.process_append_entries_response(fields)
+            elif type_str == CLIENT_COMMAND_REQUEST:
+                self.server.process_client_command(self.request)
+            else:
+                raise Exception("Unknown rpc type: %s" % type_str)
+        except Exception:
             logging.exception("Failed to process %s", fields)
 
 
@@ -139,6 +158,11 @@ class Node(socketserver.ThreadingTCPServer):
             self.leader_elect_timeout_handler)
         self._election_timer.start()
         self._hb_timer = None
+        # it will not be empty if this node is leader. key is node id and value
+        # is prev_index
+        self._nodes_prev_index = {}
+        # leader id
+        self._leader_id = None
 
     def process_vote_request(self, msg_fields):
         term_in_request = int(msg_fields[1])
@@ -171,7 +195,7 @@ class Node(socketserver.ThreadingTCPServer):
                              resp_msg, peer_id, (peer_ip, peer_port))
                 s.connect((peer_ip, peer_port))
                 s.sendall(resp_msg.encode('utf-8'))
-            except:
+            except Exception:
                 logging.exception("Failed to send response to node %s",
                                   peer_id)
 
@@ -211,6 +235,12 @@ class Node(socketserver.ThreadingTCPServer):
                                  prev_log_term, [], self._commit_index)
         rpc_msg = "%s" % rpc
         self.send_rpc_message_to_all(rpc_msg)
+        logging.info("Node %s heartbeating follower nodes: %s",
+                     self._id, rpc_msg)
+        # Start heart beat timer
+        self._hb_timer = threading.Timer(self.HB_TIME,
+                                         self.heartbeat_nodes)
+        self._hb_timer.start()
 
     def process_vote_response(self, msg_fields):
         logging.info("Vote response: %s", msg_fields)
@@ -221,22 +251,28 @@ class Node(socketserver.ThreadingTCPServer):
         if self._granted > len(self._peers) / 2:
             # Win election, change role to leader
             self._role = Node.LEADER
+            self._leader_id = self._id
             logging.info("I am the leader")
             # Start to send AppendEntriesRequest to peer nodes
             last_log_index = len(self._log_entries) - 1
             last_log_term = \
                 -1 if last_log_index == -1 \
-                    else self._log_entries[last_log_index].term
+                else self._log_entries[last_log_index].term
             rpc_msg = AppendEntryRequest(self._cur_term, self._id,
                                          last_log_index, last_log_term,
                                          [], self._commit_index)
-            self.send_rpc_message_to_all(rpc_msg)
+            self.send_rpc_message_to_all("%s" % rpc_msg)
             # Start heart beat timer
             self._hb_timer = threading.Timer(self.HB_TIME,
                                              self.heartbeat_nodes)
             self._hb_timer.start()
 
+            # stop election timer
+            if self._election_timer:
+                self._election_timer.cancel()
+
     def restart_election_timer(self):
+        logging.info("Restart election timer")
         self._election_timer.cancel()
         self._election_timer = threading.Timer(
             random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
@@ -252,10 +288,14 @@ class Node(socketserver.ThreadingTCPServer):
         resp = AppendEntryResponse(self._id, self._cur_term, 0)
         leader_id = int(msg_fields[1])
         if term_in_msg < self._cur_term:
+            logging.warning("Term in AppendEntriesRequest: %s  from %s"
+                            "< my own term: %s", term_in_msg, leader_id,
+                            self._cur_term)
             self.send_rpc_message_to_node(leader_id, "%s" % resp)
             return
 
         self._role = self.FOLLOWER
+        self._leader_id = leader_id
         if self._hb_timer is not None:
             self._hb_timer.cancel()
             self._hb_timer = None
@@ -264,21 +304,51 @@ class Node(socketserver.ThreadingTCPServer):
         my_last_log_term = \
             -1 if my_last_log_index == -1 else self._log_entries[
                 my_last_log_index]
-        prev_log_index_in_msg = msg_fields[3]
-        prev_log_term_in_msg = msg_fields[4]
+        prev_log_index_in_msg = int(msg_fields[3])
+        prev_log_term_in_msg = int(msg_fields[4])
         if my_last_log_index < prev_log_index_in_msg:
             self.send_rpc_message_to_node(leader_id, "%s" % resp)
             return
+        if my_last_log_index != prev_log_index_in_msg or \
+                my_last_log_term != prev_log_term_in_msg:
+            self._log_entries = self._log_entries[:prev_log_index_in_msg]
+            self.send_rpc_message_to_node(leader_id, "%s" % resp)
+            return
         resp.success = 1
-        if my_last_log_term != prev_log_term_in_msg:
-            self._log_entries = self._log_entries[:my_last_log_index]
         append_count = int(msg_fields[5])
         if append_count:
             # Remove '[' at the beginning and ']' at the end
             entry_string = msg_fields[6][1:-1]
             entry_list = entry_string.split(',')
             for entry in entry_list:
-                # append
+                # process entry: term:op:data
+                term, op, data = entry.split(':')
+                entry_to_append = Entry(int(term), op, data)
+                self._log_entries.append(entry_to_append)
+        self.send_rpc_message_to_node(leader_id, "%s" % resp)
+        return
+
+    def process_append_entries_response(self, msg_fields):
+        # AppendEntriesResponse fields
+        # APPEND_ENTRY_RESPONSE:sender id: sender term: success
+        _, sender, sender_term, success = msg_fields
+        sender = int(sender)
+        sender_term = int(sender_term)
+        success = int(success)
+        if not success:
+            prev_log_index =\
+                self._nodes_prev_index.setdefault(
+                    sender, len(self._log_entries) - 1) - 1
+            prev_log_term = -1 if not self._log_entries else \
+                self._log_entries[prev_log_index].term
+            self._nodes_prev_index[sender] = prev_log_index
+            rpc = AppendEntryRequest(self._cur_term,
+                                     self._id,
+                                     prev_log_index,
+                                     prev_log_term,
+                                     self._log_entries[prev_log_index + 1:],
+                                     self._commit_index)
+            self.send_rpc_message_to_node(sender, "%s" % rpc)
 
     def leader_elect_timeout_handler(self):
         logging.info("Start a new vote cycle for term: %s",
@@ -306,6 +376,19 @@ class Node(socketserver.ThreadingTCPServer):
 
     def add_peer(self, peer_id, peer_ip, peer_port):
         self._peers[peer_id] = (peer_ip, peer_port)
+
+    def process_client_command(self, connection):
+        success = 0
+        if self._leader_id is not None:
+            success = 1
+        rpc_resp = QueryLeaderResponse(self._leader_id, success)
+        resp_msg = "%s" % rpc_resp
+        logging.debug("Responding with %s", resp_msg)
+        try:
+            connection.sendall(resp_msg.encode('UTF-8'))
+        except:
+            logging.exception("Failed to respond client query")
+        logging.info("Responded with %s", resp_msg)
 
 
 if __name__ == "__main__":
