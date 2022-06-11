@@ -7,7 +7,7 @@ AVAILABLE_COMMANDS = ("query_leader",)
 def query_leader(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((host, port))
-        s.sendall(b"QUERY_LEADER_REQUEST:-1\n")
+        s.sendall(b"CLIENT_COMMAND_REQUEST:-1\n")
         print("Query sent")
         data = s.recv(1024)
         print('Received %s' % data)

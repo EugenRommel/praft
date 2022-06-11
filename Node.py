@@ -6,6 +6,7 @@ import signal
 import socket
 import socketserver
 import threading
+import concurrent.futures
 
 from logging.handlers import RotatingFileHandler
 from Common import VOTE_REQUEST_TYPE, VOTE_RESPONSE_TYPE, \
@@ -110,7 +111,7 @@ class RpcHandler(socketserver.StreamRequestHandler):
         try:
             if type_str == VOTE_REQUEST_TYPE:
                 # According to TcpServer implementation, self.server
-                # in BaseRequestHandler will be instance of TcpServer.
+                # in BaseRequestHandler will be an instance of TcpServer.
                 # As in this case, it is Node instance.
                 self.server.process_vote_request(fields)
             elif type_str == VOTE_RESPONSE_TYPE:
@@ -127,6 +128,32 @@ class RpcHandler(socketserver.StreamRequestHandler):
             logging.exception("Failed to process %s", fields)
 
 
+class NodeStatus:
+    def __init__(self, id, ip, port, health):
+        self.id = id
+        self.ip = ip
+        self.port = port
+        self.health = health
+        self._timeout_cycle = 0
+
+    def __repr__(self):
+        return "Node%s - %s:%s" % (self.id, self.ip, self.port)
+
+    def is_healthy(self):
+        return self.health == "healthy"
+
+    def timeout(self):
+        self._timeout_cycle += 1
+        logging.info("Node%s - timeout cycle: %s" %
+                     (self.id, self._timeout_cycle))
+        if self._timeout_cycle >= 10:
+            self.health = "unhealthy"
+
+    def reset_timeout(self):
+        self._timeout_cycle = 0
+        self.health = "healthy"
+
+
 class Node(socketserver.ThreadingTCPServer):
     FOLLOWER = 0
     CANDIDATE = 1
@@ -134,25 +161,31 @@ class Node(socketserver.ThreadingTCPServer):
     HB_TIME = 2
     ELECTION_TIME_LOW = 4 * HB_TIME
     ELECTION_TIME_HIGH = 8 * HB_TIME
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True,
-                 role=FOLLOWER, node_id=0, neighbors=None):
+                 role=FOLLOWER, node_id=0, neighbors=None, cur_term=0,
+                 log_entries=None):
         self._ip, self._port = server_address
         logging.info("server_address: %s", server_address)
         socketserver.TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
         self._role = role
-        self._cur_term = 0
+        self._cur_term = cur_term
         self._id = node_id
         self._vote_for = None
-        self._log_entries = []
+        if log_entries is None:
+            self._log_entries = []
+        else:
+            self._log_entries = log_entries
         self._commit_index = 0
         self._last_applied = -1
         self._peers = {}
         self._granted = 0
         for peer in neighbors:
-            # neighbors passed in is a id,ip,port tuple
+            # neighbors passed in is (id, ip, port) tuple
             # _peers is a dict with key=id, value=(ip, port)
-            self._peers[peer[0]] = (peer[1], int(peer[2]))
+            self._peers[peer[0]] = NodeStatus(*peer)
         self._election_timer = threading.Timer(
             random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
             self.leader_elect_timeout_handler)
@@ -163,6 +196,7 @@ class Node(socketserver.ThreadingTCPServer):
         self._nodes_prev_index = {}
         # leader id
         self._leader_id = None
+        self._data_file = "config.ini"
 
     def process_vote_request(self, msg_fields):
         term_in_request = int(msg_fields[1])
@@ -170,6 +204,10 @@ class Node(socketserver.ThreadingTCPServer):
         term_in_log = self._log_entries[-1].term if self._log_entries else -1
         last_log_index = len(self._log_entries) - 1
         logging.info("Process vote request: %s", msg_fields)
+        print("Vote for: %s, term_in_msg: %s, term_in_log: %s"
+              ", index_in_msg: %s, last_log_index: %s" %
+              (self._vote_for, int(msg_fields[4]), term_in_log,
+               int(msg_fields[3]), last_log_index))
         if term_in_request < self._cur_term:
             resp_msg = '%s' % resp
         else:
@@ -189,7 +227,8 @@ class Node(socketserver.ThreadingTCPServer):
                 if peer_id not in self._peers:
                     logging.error("Unknown node %s", peer_id)
                     return
-                peer_ip, peer_port = self._peers[peer_id]
+                peer_ip, peer_port = \
+                    self._peers[peer_id].ip, self._peers[peer_id].port
                 logging.info("Send vote response message: %s to node %s"
                              " with address %s",
                              resp_msg, peer_id, (peer_ip, peer_port))
@@ -200,21 +239,17 @@ class Node(socketserver.ThreadingTCPServer):
                                   peer_id)
 
     def send_rpc_message_to_all(self, rpc_message):
-        for peer_id, peer_addr in self._peers.items():
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    logging.info("Send rpc message: %s to node %s"
-                                 " with address %s",
-                                 rpc_message, peer_id, peer_addr)
-                    s.connect((peer_addr[0], peer_addr[1]))
-                    s.sendall(rpc_message.encode('utf-8'))
-                except Exception:
-                    logging.exception("Failed to communicate with node %s"
-                                      " with address %s",
-                                      peer_id, peer_addr)
+        for peer_id, peer_node in self._peers.items():
+            if peer_node.is_healthy():
+                self.mark_peer_health(peer_id, self.HEALTHY)
+            else:
+                self.mark_peer_health(peer_id, self.UNHEALTHY)
+            num_worker = min(len(self._peers), 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_worker) as executor:
+                executor.submit(self.send_rpc_message_to_node, peer_id, rpc_message)
 
     def send_rpc_message_to_node(self, node, rpc_msg):
-        peer_ip, peer_port = self._peers[node]
+        peer_ip, peer_port = self._peers[node].ip, self._peers[node].port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 logging.info("Send rpc message: %s to node %s"
@@ -226,6 +261,8 @@ class Node(socketserver.ThreadingTCPServer):
                 logging.exception("Failed to communicate with node %s"
                                   " with address %s:%s",
                                   node, peer_ip, peer_port)
+            finally:
+                self._peers[node].timeout()
 
     def heartbeat_nodes(self):
         prev_log_index = len(self._log_entries) - 1
@@ -235,7 +272,7 @@ class Node(socketserver.ThreadingTCPServer):
                                  prev_log_term, [], self._commit_index)
         rpc_msg = "%s" % rpc
         self.send_rpc_message_to_all(rpc_msg)
-        logging.info("Node %s heartbeating follower nodes: %s",
+        logging.info("Node %s heart beating follower nodes: %s",
                      self._id, rpc_msg)
         # Start heart beat timer
         self._hb_timer = threading.Timer(self.HB_TIME,
@@ -244,20 +281,28 @@ class Node(socketserver.ThreadingTCPServer):
 
     def process_vote_response(self, msg_fields):
         logging.info("Vote response: %s", msg_fields)
-        _, _, _, granted = msg_fields
+        _, id, term_in_msg, granted = msg_fields
+        self._peers[int(id)].reset_timeout()
         if int(granted):
             self._granted += 1
+        # Grant self if my term is bigger
+        if self._cur_term > int(term_in_msg):
+            self._granted += 1
         logging.debug("Granted me as leader: %s", self._granted)
-        if self._granted > len(self._peers) / 2:
+        healthy_peers = 0
+        for id, status in self._peers.items():
+            healthy_peers += status.is_healthy()
+        if self._granted > healthy_peers / 2:
             # Win election, change role to leader
             self._role = Node.LEADER
             self._leader_id = self._id
             logging.info("I am the leader")
+            print("I am leader")
             # Start to send AppendEntriesRequest to peer nodes
             last_log_index = len(self._log_entries) - 1
             last_log_term = \
                 -1 if last_log_index == -1 \
-                else self._log_entries[last_log_index].term
+                    else self._log_entries[last_log_index].term
             rpc_msg = AppendEntryRequest(self._cur_term, self._id,
                                          last_log_index, last_log_term,
                                          [], self._commit_index)
@@ -322,8 +367,8 @@ class Node(socketserver.ThreadingTCPServer):
             entry_list = entry_string.split(',')
             for entry in entry_list:
                 # process entry: term:op:data
-                term, op, data = entry.split(':')
-                entry_to_append = Entry(int(term), op, data)
+                term_in_entry, op, data = entry.split(':')
+                entry_to_append = Entry(int(term_in_entry), op, data)
                 self._log_entries.append(entry_to_append)
         self.send_rpc_message_to_node(leader_id, "%s" % resp)
         return
@@ -331,12 +376,12 @@ class Node(socketserver.ThreadingTCPServer):
     def process_append_entries_response(self, msg_fields):
         # AppendEntriesResponse fields
         # APPEND_ENTRY_RESPONSE:sender id: sender term: success
-        _, sender, sender_term, success = msg_fields
+        _, sender, _, success = msg_fields
         sender = int(sender)
-        sender_term = int(sender_term)
+        self._peers[sender].reset_timeout()
         success = int(success)
         if not success:
-            prev_log_index =\
+            prev_log_index = \
                 self._nodes_prev_index.setdefault(
                     sender, len(self._log_entries) - 1) - 1
             prev_log_term = -1 if not self._log_entries else \
@@ -350,15 +395,27 @@ class Node(socketserver.ThreadingTCPServer):
                                      self._commit_index)
             self.send_rpc_message_to_node(sender, "%s" % rpc)
 
+    def persist_term(self):
+        config_parser = configparser.ConfigParser()
+        config_parser.read([self._data_file])
+        config_parser.set("Node%d" % self._id, "term",
+                          "%d" % self._cur_term)
+        with open(self._data_file, 'w+') as out:
+            config_parser.write(out)
+
     def leader_elect_timeout_handler(self):
         logging.info("Start a new vote cycle for term: %s",
                      self._cur_term)
+        if self._role == self.LEADER:
+            logging.warning("I am NOT leader any more")
+            print("I am NOT leader any more")
         self._role = self.CANDIDATE
         self._vote_for = None
         self._granted = 0
         self._cur_term += 1
         self.request_vote()
         self.restart_election_timer()
+        self.persist_term()
 
     def request_vote(self):
         last_log_index = len(self._log_entries) - 1
@@ -374,8 +431,24 @@ class Node(socketserver.ThreadingTCPServer):
         else:
             self.send_rpc_message_to_all(rpc_message)
 
-    def add_peer(self, peer_id, peer_ip, peer_port):
-        self._peers[peer_id] = (peer_ip, peer_port)
+    def add_peer(self, peer_id, peer_ip, peer_port, health):
+        self._peers[peer_id] = NodeStatus(peer_id, peer_ip,
+                                          peer_port, health)
+
+    def mark_peer_health(self, peer_id, health):
+        config_parser = configparser.ConfigParser()
+        config_parser.read([self._data_file])
+        section = "Node%d" % self._id
+        print("Node %s: %s" % (peer_id, self._peers[peer_id].health))
+        peer_nodes = config_parser[section]['peers'].split(',')
+        peer_list = [p.split(':') for p in peer_nodes]
+        for p in peer_list:
+            if p[0] == str(peer_id):
+                p[3] = health
+        peers_value = ','.join([':'.join(p) for p in peer_list])
+        config_parser.set(section_name, "peers", peers_value)
+        with open(self._data_file, 'w+') as out:
+            config_parser.write(out)
 
     def process_client_command(self, connection):
         success = 0
@@ -410,11 +483,13 @@ if __name__ == "__main__":
     node_port = int(config[section_name]['port'])
     node_peers = config[section_name]['peers'].split(',')
     peers = [p.split(':') for p in node_peers]
-    peers = [(int(p[0]), p[1], p[2]) for p in peers]
+    peers = [(int(p[0]), p[1], int(p[2]), p[3]) for p in peers]
+    term = int(config[section_name]['term'])
+    entries = config[section_name].get('entries', None)
 
     logging.basicConfig(
         handlers=[RotatingFileHandler(
-            'Node%d.log' % args.node, maxBytes=20 * 1024 * 1024, backupCount=10)],
+            'Node%d.log' % args.node, maxBytes=2 * 1024 * 1024, backupCount=10)],
         level=logging.DEBUG,
         format="[%(asctime)s] %(levelname)s [%(funcName)s] %(message)s",
         datefmt='%Y-%m-%dT%H:%M:%S')
@@ -422,5 +497,6 @@ if __name__ == "__main__":
     logging.info("Node run on %s:%s with id %s", node_ip, node_port, args.node)
     logging.info("Peer nodes: %s", peers)
     with Node((node_ip, node_port), RpcHandler, True, Node.FOLLOWER,
-              node_id=args.node, neighbors=peers) as n:
+              node_id=args.node, neighbors=peers, cur_term=term,
+              log_entries=entries) as n:
         n.serve_forever()
