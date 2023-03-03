@@ -1,0 +1,15 @@
+{
+  "1": {
+    "ip": "localhost",
+    "port": 50051
+  },
+  "2": {
+    "ip": "localhost",
+    "port": 50052
+  },
+  "3": {
+    "ip": "localhost",
+    "port": 50053
+  },
+  "members": ["1", "2", "3"]
+}

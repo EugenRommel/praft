@@ -1,49 +1,17 @@
 import argparse
-import configparser
+import grpc
+import json
 import logging
 import random
-import signal
-import socket
-import socketserver
 import threading
-import concurrent.futures
+
+from concurrent import futures
+from typing import Tuple
+
+import raft_pb2
+import raft_pb2_grpc
 
 from logging.handlers import RotatingFileHandler
-from Common import VOTE_REQUEST_TYPE, VOTE_RESPONSE_TYPE, \
-    APPEND_ENTRY_REQUEST, APPEND_ENTRY_RESPONSE, \
-    CLIENT_COMMAND_REQUEST, CLIENT_COMMAND_RESPONSE, \
-    CLIEN_SUBCOMMAND_QURERY_LEADER
-
-
-class VoteRequest:
-    def __init__(self, sender_id, term, candidate_id,
-                 last_log_index, last_log_term):
-        self.sender = sender_id
-        self.term = term
-        self.candidate_id = candidate_id
-        self.last_log_index = last_log_index
-        self.last_log_term = last_log_term
-
-    def __repr__(self):
-        return "{}:{}:{}:{}:{}:{}".format(VOTE_REQUEST_TYPE,
-                                          self.sender,
-                                          self.term,
-                                          self.candidate_id,
-                                          self.last_log_index,
-                                          self.last_log_term)
-
-
-class VoteResponse:
-    def __init__(self, sender, term, granted):
-        self.sender = sender
-        self.term = term
-        self.granted = granted
-
-    def __repr__(self):
-        return "{}:{}:{}:{}".format(VOTE_RESPONSE_TYPE,
-                                    self.sender, self.term,
-                                    self.granted)
-
 
 class Entry:
     def __init__(self, term, op, data):
@@ -55,81 +23,8 @@ class Entry:
         return "{}:{}:{}".format(self.term, self.op, self.data)
 
 
-class AppendEntryRequest:
-    def __init__(self, term, leader_id, prev_log_index, prev_log_term,
-                 entries, leader_commit_index):
-        self.leader_id = leader_id
-        self.term = term
-        self.prev_log_index = prev_log_index
-        self.prev_log_term = prev_log_term
-        self.entries = entries
-        self.leader_commit_index = leader_commit_index
-
-    def __repr__(self):
-        return "{}:{}:{}:{}:{}:{}:{}".format(APPEND_ENTRY_REQUEST,
-                                             self.leader_id,
-                                             self.term,
-                                             self.prev_log_index,
-                                             self.prev_log_term,
-                                             len(self.entries),
-                                             self.entries,
-                                             self.leader_commit_index)
-
-
-class AppendEntryResponse:
-    def __init__(self, sender, term, success):
-        self.sender = sender
-        self.term = term
-        self.success = success
-
-    def __repr__(self):
-        return "{}:{}:{}:{}".format(APPEND_ENTRY_RESPONSE,
-                                    self.sender,
-                                    self.term, self.success)
-
-
-class QueryLeaderResponse:
-    def __init__(self, leader, success):
-        self.leader = leader
-        self.success = success
-
-    def __repr__(self):
-        return "{}:{}:{}".format(CLIENT_COMMAND_RESPONSE,
-                                 CLIEN_SUBCOMMAND_QURERY_LEADER,
-                                 self.leader, self.success)
-
-
-class RpcHandler(socketserver.StreamRequestHandler):
-    def handle(self):
-        data = self.rfile.readline().strip()
-        logging.info("Received %s from %s", data, self.client_address)
-        data_str = data.decode('utf-8')
-        fields = data_str.split(":")
-        type_str = fields[0]
-        sender = fields[1]
-        logging.info("Type: %s, sender: node %s", type_str, sender)
-        try:
-            if type_str == VOTE_REQUEST_TYPE:
-                # According to TcpServer implementation, self.server
-                # in BaseRequestHandler will be an instance of TcpServer.
-                # As in this case, it is Node instance.
-                self.server.process_vote_request(fields)
-            elif type_str == VOTE_RESPONSE_TYPE:
-                self.server.process_vote_response(fields)
-            elif type_str == APPEND_ENTRY_REQUEST:
-                self.server.process_append_entries_request(fields)
-            elif type_str == APPEND_ENTRY_RESPONSE:
-                self.server.process_append_entries_response(fields)
-            elif type_str == CLIENT_COMMAND_REQUEST:
-                self.server.process_client_command(self.request)
-            else:
-                raise Exception("Unknown rpc type: %s" % type_str)
-        except Exception:
-            logging.exception("Failed to process %s", fields)
-
-
 class NodeStatus:
-    def __init__(self, id, ip, port, health):
+    def __init__(self, id, ip, port, health='healthy'):
         self.id = id
         self.ip = ip
         self.port = port
@@ -154,6 +49,7 @@ class NodeStatus:
         self.health = "healthy"
 
 
+"""
 class Node(socketserver.ThreadingTCPServer):
     FOLLOWER = 0
     CANDIDATE = 1
@@ -180,12 +76,8 @@ class Node(socketserver.ThreadingTCPServer):
             self._log_entries = log_entries
         self._commit_index = 0
         self._last_applied = -1
-        self._peers = {}
+        self._peers = peers
         self._granted = 0
-        for peer in neighbors:
-            # neighbors passed in is (id, ip, port) tuple
-            # _peers is a dict with key=id, value=(ip, port)
-            self._peers[peer[0]] = NodeStatus(*peer)
         self._election_timer = threading.Timer(
             random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
             self.leader_elect_timeout_handler)
@@ -196,7 +88,10 @@ class Node(socketserver.ThreadingTCPServer):
         self._nodes_prev_index = {}
         # leader id
         self._leader_id = None
-        self._data_file = "config.ini"
+        self._data_file = "Node{}.json".format(node_id)
+        self._data_content = {}
+        with open(self._data_file) as f:
+            self._data_content = json.load(f)
 
     def process_vote_request(self, msg_fields):
         term_in_request = int(msg_fields[1])
@@ -224,32 +119,30 @@ class Node(socketserver.ThreadingTCPServer):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 peer_id = int(msg_fields[1])
-                if peer_id not in self._peers:
-                    logging.error("Unknown node %s", peer_id)
-                    return
-                peer_ip, peer_port = \
-                    self._peers[peer_id].ip, self._peers[peer_id].port
-                logging.info("Send vote response message: %s to node %s"
-                             " with address %s",
-                             resp_msg, peer_id, (peer_ip, peer_port))
-                s.connect((peer_ip, peer_port))
-                s.sendall(resp_msg.encode('utf-8'))
+                for peer in self._peers:
+                    if peer.id != peer_id:
+                        continue
+                    logging.info("Send vote response message: %s to node %s"
+                                 " with address %s",
+                                 resp_msg, peer_id, (peer.ip, peer.port))
+                    s.connect((peer.ip, peer.port))
+                    s.sendall(resp_msg.encode('utf-8'))
             except Exception:
                 logging.exception("Failed to send response to node %s",
                                   peer_id)
 
     def send_rpc_message_to_all(self, rpc_message):
-        for peer_id, peer_node in self._peers.items():
+        for peer_node in self._peers:
             if peer_node.is_healthy():
-                self.mark_peer_health(peer_id, self.HEALTHY)
+                self.mark_peer_health(peer_node, self.HEALTHY)
             else:
-                self.mark_peer_health(peer_id, self.UNHEALTHY)
+                self.mark_peer_health(peer_node, self.UNHEALTHY)
             num_worker = min(len(self._peers), 4)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_worker) as executor:
-                executor.submit(self.send_rpc_message_to_node, peer_id, rpc_message)
+            with futures.ThreadPoolExecutor(max_workers=num_worker) as executor:
+                executor.submit(self.send_rpc_message_to_node, peer_node, rpc_message)
 
     def send_rpc_message_to_node(self, node, rpc_msg):
-        peer_ip, peer_port = self._peers[node].ip, self._peers[node].port
+        peer_ip, peer_port = node.ip, node.port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 logging.info("Send rpc message: %s to node %s"
@@ -260,9 +153,9 @@ class Node(socketserver.ThreadingTCPServer):
             except Exception:
                 logging.exception("Failed to communicate with node %s"
                                   " with address %s:%s",
-                                  node, peer_ip, peer_port)
+                                  node.id, peer_ip, peer_port)
             finally:
-                self._peers[node].timeout()
+                node.timeout()
 
     def heartbeat_nodes(self):
         prev_log_index = len(self._log_entries) - 1
@@ -282,7 +175,8 @@ class Node(socketserver.ThreadingTCPServer):
     def process_vote_response(self, msg_fields):
         logging.info("Vote response: %s", msg_fields)
         _, id, term_in_msg, granted = msg_fields
-        self._peers[int(id)].reset_timeout()
+        for peer in self._peers:
+            peer.reset_timeout()
         if int(granted):
             self._granted += 1
         # Grant self if my term is bigger
@@ -290,7 +184,7 @@ class Node(socketserver.ThreadingTCPServer):
             self._granted += 1
         logging.debug("Granted me as leader: %s", self._granted)
         healthy_peers = 0
-        for id, status in self._peers.items():
+        for status in self._peers:
             healthy_peers += status.is_healthy()
         if self._granted > healthy_peers / 2:
             # Win election, change role to leader
@@ -378,7 +272,10 @@ class Node(socketserver.ThreadingTCPServer):
         # APPEND_ENTRY_RESPONSE:sender id: sender term: success
         _, sender, _, success = msg_fields
         sender = int(sender)
-        self._peers[sender].reset_timeout()
+        for peer in self._peers:
+            if peer.id != sender:
+                continue
+            peer.reset_timeout()
         success = int(success)
         if not success:
             prev_log_index = \
@@ -396,12 +293,9 @@ class Node(socketserver.ThreadingTCPServer):
             self.send_rpc_message_to_node(sender, "%s" % rpc)
 
     def persist_term(self):
-        config_parser = configparser.ConfigParser()
-        config_parser.read([self._data_file])
-        config_parser.set("Node%d" % self._id, "term",
-                          "%d" % self._cur_term)
+        self._data_content['term'] = self._cur_term
         with open(self._data_file, 'w+') as out:
-            config_parser.write(out)
+            json.dump(self._data_content, out)
 
     def leader_elect_timeout_handler(self):
         logging.info("Start a new vote cycle for term: %s",
@@ -423,32 +317,19 @@ class Node(socketserver.ThreadingTCPServer):
             last_log_term = self._log_entries[last_log_index].term
         else:
             last_log_term = 0
-        rpc_message = '%s' % VoteRequest(self._id, self._cur_term, self._id,
-                                         last_log_index,
-                                         last_log_term)
+        rpc_message = raft_pb2.MsgVoteRequest(self._cur_term, self._id,
+                                              last_log_index,
+                                              last_log_term)
         if not self._peers:
             self._role = Node.LEADER
         else:
             self.send_rpc_message_to_all(rpc_message)
 
     def add_peer(self, peer_id, peer_ip, peer_port, health):
-        self._peers[peer_id] = NodeStatus(peer_id, peer_ip,
-                                          peer_port, health)
+        self._peers.append(NodeStatus(peer_id, peer_ip, peer_port, health))
 
-    def mark_peer_health(self, peer_id, health):
-        config_parser = configparser.ConfigParser()
-        config_parser.read([self._data_file])
-        section = "Node%d" % self._id
-        print("Node %s: %s" % (peer_id, self._peers[peer_id].health))
-        peer_nodes = config_parser[section]['peers'].split(',')
-        peer_list = [p.split(':') for p in peer_nodes]
-        for p in peer_list:
-            if p[0] == str(peer_id):
-                p[3] = health
-        peers_value = ','.join([':'.join(p) for p in peer_list])
-        config_parser.set(section_name, "peers", peers_value)
-        with open(self._data_file, 'w+') as out:
-            config_parser.write(out)
+    def mark_peer_health(self, peer, health):
+        peer.health = health
 
     def process_client_command(self, connection):
         success = 0
@@ -462,41 +343,337 @@ class Node(socketserver.ThreadingTCPServer):
         except:
             logging.exception("Failed to respond client query")
         logging.info("Responded with %s", resp_msg)
+"""
 
+
+class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
+    FOLLOWER = 0
+    CANDIDATE = 1
+    LEADER = 2
+    HB_TIME = 2
+    ELECTION_TIME_LOW = 4 * HB_TIME
+    ELECTION_TIME_HIGH = 8 * HB_TIME
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    def __init__(self, node_id: str, peers: list[NodeStatus] = None,
+                 cur_term: int =0, log_entries: list[Entry] = None) -> None:
+        self._lock = threading.Lock()
+        self._role = self.FOLLOWER
+        self._cur_term = cur_term
+        self._id = node_id
+        self._vote_for = None
+        if log_entries is None:
+            self._log_entries = []
+        else:
+            self._log_entries = log_entries
+        self._commit_index = 0
+        self._last_applied = -1
+        self._peers = peers
+        self._granted = 0
+        self._election_timer = threading.Timer(
+            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
+            self.leader_elect_timeout_handler)
+        self._election_timer.start()
+        self._hb_timer = None
+        # it will not be empty if this node is leader. key is node id and value
+        # is prev_index
+        self._nodes_prev_index = {}
+        # leader id
+        self._leader_id = None
+        self._data_file = "Node{}.json".format(node_id)
+        self._data_content = {}
+        try:
+            with open(self._data_file) as f:
+                self._data_content = json.load(f)
+        except FileNotFoundError:
+            self._data_content['term'] = self._cur_term
+            with open(self._data_file, 'w+') as f:
+                json.dump(self._data_file, f)
+
+    def heartbeat_nodes(self):
+        prev_log_index = len(self._log_entries) - 1
+        prev_log_term = \
+            0 if prev_log_index else self._log_entries[prev_log_index].term
+        rpc = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id, prevLogIndex=prev_log_index,
+                                               prevLogTerm=prev_log_term, leaderCommit=self._commit_index,
+                                               entries=[])
+        self.send_append_entries_to_all(rpc)
+        logging.info("Node %s heart beating follower nodes: %s",
+                     self._id, rpc)
+        # Start heart beat timer
+        self._hb_timer = threading.Timer(self.HB_TIME,
+                                         self.heartbeat_nodes)
+        self._hb_timer.start()
+
+    def persist_term_and_vote(self):
+        self._data_content['term'] = self._cur_term
+        self._data_content['vote_for'] = self._vote_for
+        with open(self._data_file, 'w+') as out:
+            json.dump(self._data_content, out)
+
+    def persist_entries(self):
+        self._data_content['entries'] = self._log_entries
+        with open(self._data_file, 'w+') as out:
+            json.dump(self._data_content, out)
+
+    def leader_elect_timeout_handler(self):
+        logging.info("Start a new vote cycle for term: %s",
+                     self._cur_term)
+        with self._lock:
+            if self._role == self.LEADER:
+                logging.warning("I am NOT leader any more")
+                print("I am NOT leader any more")
+            self._role = self.CANDIDATE
+            self._vote_for = None
+            self._granted = 0
+            self._cur_term += 1
+            self.persist_term_and_vote()
+        self.send_request_vote()
+        self.restart_election_timer()
+
+    def restart_election_timer(self):
+        logging.info("Restart election timer")
+        self._election_timer.cancel()
+        self._election_timer = threading.Timer(
+            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
+            self.leader_elect_timeout_handler)
+        self._election_timer.start()
+
+    @staticmethod
+    def send_append_entries_message(id: str, ip: str, port: int, msg: raft_pb2.MsgAppendEntriesRequest) \
+            -> Tuple[str, raft_pb2.MsgAppendEntriesResponse]:
+        logging.debug('Send append entries %s to %s:%s', msg, ip, port)
+        while True:
+            try:
+                with grpc.insecure_channel(f'{ip}:{port}') as channel:
+                    stub = raft_pb2_grpc.RaftNodeStub(channel)
+                    return id, stub.AppendEntries(msg)
+            except:
+                logging.exception(f"Failed to send append entries message to {ip}:{port}, retry")
+
+    def handle_append_entries_response(self, id: str, rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
+        while not rsp.success:
+            prev_log_index = \
+                self._nodes_prev_index.getdefault(
+                    id, len(self._log_entries) - 1) - 1
+            if prev_log_index < -1:
+                prev_log_index = -1
+            prev_log_term = 0 if not self._log_entries else \
+                self._log_entries[prev_log_index].term
+            self._nodes_prev_index[id] = prev_log_index
+            rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term,
+                                                   leaderId=self._id,
+                                                   prevLogIndex=prev_log_index,
+                                                   prevLogTerm=prev_log_term,
+                                                   entries=self._log_entries[prev_log_index:],
+                                                   leaderCommit=self._commit_index)
+            for peer in self._peers:
+                if peer.id == id:
+                    id_, resp_ = self.send_append_entries_message(id, peer.ip, peer.port, rpc_msg)
+                    break
+
+    def send_append_entries_to_all(self, msg: raft_pb2.MsgAppendEntriesRequest) -> None:
+        f_list = []
+        with futures.ThreadPoolExecutor(max_workers=4) as t:
+            for peer in self._peers:
+                logging.debug("Send AppendEntries to Node%s - %s:%s", peer.id, peer.ip, peer.port)
+                f = t.submit(self.send_append_entries_message, peer.id, peer.ip, peer.port, msg)
+                f_list.append(f)
+            for f in futures.as_completed(f_list):
+                id, resp = f.result()
+                self.handle_append_entries_response(id, resp)
+
+    def handle_vote_response(self, resp: raft_pb2.MsgVoteResponse) -> None:
+        if resp.voteGranted:
+            switch_to_leader = False
+            with self._lock:
+                self._granted += 1
+                logging.debug("%s Granted me as leader", self._granted)
+                # Win election, change role to leader
+                if self._granted > len(self._peers) / 2:
+                    switch_to_leader = True
+            if switch_to_leader:
+                with self._lock:
+                    self._role = self.LEADER
+                    self._leader_id = self._id
+                logging.info("I am the leader")
+                print("I am leader")
+                # Start to send AppendEntriesRequest to peer nodes
+                last_log_index = len(self._log_entries) - 1
+                last_log_term = \
+                    0 if last_log_index == -1 \
+                        else self._log_entries[last_log_index].term
+                rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id,
+                                                           prevLogIndex=last_log_index, prevLogTerm=last_log_term,
+                                                           entries=self._log_entries, leaderCommit=self._commit_index)
+                # Start heart beat timer
+                self._hb_timer = threading.Timer(self.HB_TIME,
+                                                 self.heartbeat_nodes)
+                self._hb_timer.start()
+
+                # stop election timer
+                if self._election_timer:
+                    self._election_timer.cancel()
+                self.send_append_entries_to_all(rpc_msg)
+        else:
+            # update term with response term
+            if resp.term > self._cur_term:
+                with self._lock:
+                    self._cur_term = resp.term
+
+    @staticmethod
+    def send_request_vote_message(ip: str, port: int, msg: raft_pb2.MsgVoteRequest) \
+            -> raft_pb2.MsgVoteResponse:
+        logging.info('Send request vote %s to %s:%s', msg, ip, port)
+        while True:
+            try:
+                with grpc.insecure_channel(f'{ip}:{port}') as channel:
+                    stub = raft_pb2_grpc.RaftNodeStub(channel)
+                    return stub.RequestVote(msg)
+            except:
+                logging.exception(f"Failed to send request vote message to {ip}:{port}, retry")
+
+    def send_request_vote_to_all(self, msg: raft_pb2.MsgVoteRequest) -> None:
+        # Grant myself at first
+        with self._lock:
+            if self._vote_for is None:
+                self._granted += 1
+                self._vote_for = self._id
+        f_list = []
+        with futures.ThreadPoolExecutor(max_workers=4) as t:
+            for peer in self._peers:
+                f = t.submit(self.send_request_vote_message, peer.ip, peer.port, msg)
+                f_list.append(f)
+            for f in futures.as_completed(f_list):
+                resp = f.result()
+                self.handle_vote_response(resp)
+
+    def send_request_vote(self):
+        last_log_index = len(self._log_entries) - 1
+        if last_log_index > -1:
+            last_log_term = self._log_entries[last_log_index].term
+        else:
+            last_log_term = 0
+        rpc_message = raft_pb2.MsgVoteRequest(term=self._cur_term, candidateId=self._id,
+                                              lastLogIndex=last_log_index,
+                                              lastLogTerm=last_log_term)
+        if not self._peers:
+            self._role = self.LEADER
+        else:
+            self.send_request_vote_to_all(rpc_message)
+
+    def RequestVote(self, request, context):
+        term_in_request = request.term
+        resp = raft_pb2.MsgVoteResponse(term=self._cur_term, voteGranted=False)
+        term_in_log = self._log_entries[-1].term if self._log_entries else -1
+        last_log_index = len(self._log_entries) - 1
+        logging.info("Process vote request: %s", request)
+        if term_in_request >= self._cur_term:
+            if self._vote_for is None and \
+                    (request.lastLogTerm > term_in_log or
+                     (request.lastLogTerm == term_in_log and
+                      request.lastLogIndex >= last_log_index)):
+                resp.voteGranted = True
+                resp.term = term_in_request
+                self._vote_for = request.candidateId
+                self._cur_term = term_in_request
+                print("Vote for: %s, term_in_msg: %s, term_in_log: %s"
+                      ", index_in_msg: %s, last_log_index: %s" %
+                      (self._vote_for, term_in_request, term_in_log,
+                       request.lastLogIndex, last_log_index))
+        return resp
+
+    def AppendEntries(self, request: raft_pb2.MsgAppendEntriesRequest, context):
+        logging.debug("Process append entries request: %s", request)
+        # AppendEntriesRequest message fields:
+        # APPEND_ENTRY_REQUEST:leader_id:term:prev_log_index:
+        # prev_log_term:entries count:entry[0]...:commit_log_index
+        term_in_msg = request.term
+        leader_id = int(request.leaderId)
+        if term_in_msg < self._cur_term:
+            logging.warning("Term in AppendEntriesRequest: %s  from %s"
+                            "< my own term: %s", term_in_msg, leader_id,
+                            self._cur_term)
+            return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
+
+        with self._lock:
+            self._role = self.FOLLOWER
+            self._leader_id = leader_id
+            self._cur_term = term_in_msg
+            self.persist_term_and_vote()
+        # Received AppendEntries means this node is follower
+        if self._hb_timer is not None:
+            self._hb_timer.cancel()
+            self._hb_timer = None
+        self.restart_election_timer()
+        my_last_log_index = len(self._log_entries) - 1
+        my_last_log_term = \
+            0 if my_last_log_index == -1 else self._log_entries[
+                my_last_log_index]
+        prev_log_index_in_msg = request.prevLogIndex
+        prev_log_term_in_msg = request.prevLogTerm
+        if my_last_log_index < prev_log_index_in_msg:
+            return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
+        if my_last_log_term != prev_log_term_in_msg:
+            self._log_entries = self._log_entries[:prev_log_index_in_msg]
+        if request.entries:
+           self._log_entries.extend(request.entries)
+           self.persist_entries()
+        with self._lock:
+            if request.leaderCommit > self._commit_index:
+                self._commit_index = min(request.leaderCommit, len(self._log_entries) - 1)
+        return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=True)
+
+
+def serve(port, node_id, neighbors, cur_term, entries):
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    raft_pb2_grpc.add_RaftNodeServicer_to_server(
+        RaftServicer(node_id, neighbors, cur_term, entries), server)
+    server.add_insecure_port(f"[::]:{port}")
+    server.start()
+    print(f"Server started, listening on {port}")
+    server.wait_for_termination()
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument("--conf", help="config file path", default='config.ini')
+    arg_parser.add_argument("--conf", help="config file path", default='config.json')
     # Node id is an integer. It requires there is corresponding
     # section 'Node'+ id exists in config file specified by
     # --conf option. For example, if node id is 0, there should
     # be a section 'Node0' in config file
-    arg_parser.add_argument("--node", type=int, help="id of node")
+    arg_parser.add_argument("--node", help="id of node")
     args = arg_parser.parse_args()
-    config = configparser.ConfigParser()
-    config.read(args.conf)
-    section_name = 'Node{}'.format(args.node)
-    if section_name not in config:
-        print("Node {} config not found in {}".format(args.node, args.conf))
+    #config = {}
+    with open(args.conf) as f:
+        config = json.load(f)
+    if args.node not in config:
+        logging.error(f"{args.node} not found in {args.conf}")
         exit(-1)
-    node_ip = config[section_name]['ip'].strip()
-    node_port = int(config[section_name]['port'])
-    node_peers = config[section_name]['peers'].split(',')
-    peers = [p.split(':') for p in node_peers]
-    peers = [(int(p[0]), p[1], int(p[2]), p[3]) for p in peers]
-    term = int(config[section_name]['term'])
-    entries = config[section_name].get('entries', None)
+    node_ip = config[args.node]['ip']
+    node_port = config[args.node]['port']
+    peers = [NodeStatus(n, config[n]['ip'], config[n]['port']) \
+             for n in config['members'] if n != args.node]
+    term = 0
+    entries = []
+    with open('Node{}.json'.format(args.node), 'w+') as f:
+        try:
+            data = json.load(f)
+            term = data['term']
+            entries = data['entries']
+        except:
+            data = {}
+            data['term'] = term
+            data['entries'] = entries
+            json.dump(data, f)
 
     logging.basicConfig(
         handlers=[RotatingFileHandler(
-            'Node%d.log' % args.node, maxBytes=2 * 1024 * 1024, backupCount=10)],
+            f'Node{args.node}.log', maxBytes=2 * 1024 * 1024, backupCount=10)],
         level=logging.DEBUG,
         format="[%(asctime)s] %(levelname)s [%(funcName)s] %(message)s",
         datefmt='%Y-%m-%dT%H:%M:%S')
 
     logging.info("Node run on %s:%s with id %s", node_ip, node_port, args.node)
     logging.info("Peer nodes: %s", peers)
-    with Node((node_ip, node_port), RpcHandler, True, Node.FOLLOWER,
-              node_id=args.node, neighbors=peers, cur_term=term,
-              log_entries=entries) as n:
-        n.serve_forever()
+    serve(node_port, args.node, peers, term, entries)
+
