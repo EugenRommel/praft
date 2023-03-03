@@ -13,6 +13,7 @@ import raft_pb2_grpc
 
 from logging.handlers import RotatingFileHandler
 
+
 class Entry:
     def __init__(self, term, op, data):
         self.term = term
@@ -53,13 +54,14 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 2
-    HB_TIME = 2
+    HB_TIME = 1
     ELECTION_TIME_LOW = 4 * HB_TIME
     ELECTION_TIME_HIGH = 8 * HB_TIME
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
+
     def __init__(self, node_id: str, peers: list[NodeStatus] = None,
-                 cur_term: int =0, log_entries: list[Entry] = None) -> None:
+                 cur_term: int = 0, log_entries: list[Entry] = None) -> None:
         self._lock = threading.Lock()
         self._role = self.FOLLOWER
         self._cur_term = cur_term
@@ -120,12 +122,14 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             json.dump(self._data_content, out)
 
     def leader_elect_timeout_handler(self):
+        with self._lock:
+            if self._role == self.LEADER:
+                logging.debug("I am leader, exit")
+                return
+
         logging.info("Start a new vote cycle for term: %s",
                      self._cur_term)
         with self._lock:
-            if self._role == self.LEADER:
-                logging.warning("I am NOT leader any more")
-                print("I am NOT leader any more")
             self._role = self.CANDIDATE
             self._vote_for = None
             self._granted = 0
@@ -165,11 +169,11 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 self._log_entries[prev_log_index].term
             self._nodes_prev_index[id] = prev_log_index
             rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term,
-                                                   leaderId=self._id,
-                                                   prevLogIndex=prev_log_index,
-                                                   prevLogTerm=prev_log_term,
-                                                   entries=self._log_entries[prev_log_index:],
-                                                   leaderCommit=self._commit_index)
+                                                       leaderId=self._id,
+                                                       prevLogIndex=prev_log_index,
+                                                       prevLogTerm=prev_log_term,
+                                                       entries=self._log_entries[prev_log_index:],
+                                                       leaderCommit=self._commit_index)
             for peer in self._peers:
                 if peer.id == id:
                     id_, resp_ = self.send_append_entries_message(id, peer.ip, peer.port, rpc_msg)
@@ -288,6 +292,11 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
 
     def AppendEntries(self, request: raft_pb2.MsgAppendEntriesRequest, context):
         logging.debug("Process append entries request: %s", request)
+        # Received AppendEntries means this node is follower
+        if self._hb_timer is not None:
+            self._hb_timer.cancel()
+            self._hb_timer = None
+        self.restart_election_timer()
         # AppendEntriesRequest message fields:
         # APPEND_ENTRY_REQUEST:leader_id:term:prev_log_index:
         # prev_log_term:entries count:entry[0]...:commit_log_index
@@ -304,11 +313,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             self._leader_id = leader_id
             self._cur_term = term_in_msg
             self.persist_term_and_vote()
-        # Received AppendEntries means this node is follower
-        if self._hb_timer is not None:
-            self._hb_timer.cancel()
-            self._hb_timer = None
-        self.restart_election_timer()
+
         my_last_log_index = len(self._log_entries) - 1
         my_last_log_term = \
             0 if my_last_log_index == -1 else self._log_entries[
@@ -320,8 +325,8 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         if my_last_log_term != prev_log_term_in_msg:
             self._log_entries = self._log_entries[:prev_log_index_in_msg]
         if request.entries:
-           self._log_entries.extend(request.entries)
-           self.persist_entries()
+            self._log_entries.extend(request.entries)
+            self.persist_entries()
         with self._lock:
             if request.leaderCommit > self._commit_index:
                 self._commit_index = min(request.leaderCommit, len(self._log_entries) - 1)
@@ -337,6 +342,7 @@ def serve(port, node_id, neighbors, cur_term, entries):
     print(f"Server started, listening on {port}")
     server.wait_for_termination()
 
+
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--conf", help="config file path", default='config.json')
@@ -346,7 +352,7 @@ if __name__ == "__main__":
     # be a section 'Node0' in config file
     arg_parser.add_argument("--node", help="id of node")
     args = arg_parser.parse_args()
-    #config = {}
+    # config = {}
     with open(args.conf) as f:
         config = json.load(f)
     if args.node not in config:
@@ -379,4 +385,3 @@ if __name__ == "__main__":
     logging.info("Node run on %s:%s with id %s", node_ip, node_port, args.node)
     logging.info("Peer nodes: %s", peers)
     serve(node_port, args.node, peers, term, entries)
-
