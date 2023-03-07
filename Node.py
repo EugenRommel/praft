@@ -1,4 +1,6 @@
 import argparse
+import os
+
 import grpc
 import json
 import logging
@@ -12,6 +14,9 @@ import raft_pb2
 import raft_pb2_grpc
 
 from logging.handlers import RotatingFileHandler
+
+LOG_DIR = "log"
+DATA_DIR = "data"
 
 
 class Entry:
@@ -85,7 +90,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self._nodes_prev_index = {}
         # leader id
         self._leader_id = None
-        self._data_file = "Node{}.json".format(node_id)
+        self._data_file = os.path.join(DATA_DIR, "Node{}.json".format(node_id))
         self._data_content = {}
         try:
             with open(self._data_file) as f:
@@ -364,7 +369,11 @@ if __name__ == "__main__":
              for n in config['members'] if n != args.node]
     term = 0
     entries = []
-    with open('Node{}.json'.format(args.node), 'w+') as f:
+
+    data_dir = os.path.join(DATA_DIR, 'Node{}.json'.format(args.node))
+    if not os.path.exists(DATA_DIR):
+        os.mkdir(DATA_DIR, 0o755)
+    with open(data_dir, 'w+') as f:
         try:
             data = json.load(f)
             term = data['term']
@@ -375,9 +384,12 @@ if __name__ == "__main__":
             data['entries'] = entries
             json.dump(data, f)
 
+    if not os.path.exists(LOG_DIR):
+        os.mkdir(LOG_DIR, 0o755)
+    log_dir = os.path.join(LOG_DIR, f'Node{args.node}.log')
     logging.basicConfig(
         handlers=[RotatingFileHandler(
-            f'Node{args.node}.log', maxBytes=2 * 1024 * 1024, backupCount=10)],
+        log_dir, maxBytes=2 * 1024 * 1024, backupCount=10)],
         level=logging.DEBUG,
         format="[%(asctime)s] %(levelname)s [%(funcName)s] %(message)s",
         datefmt='%Y-%m-%dT%H:%M:%S')
