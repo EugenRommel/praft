@@ -218,6 +218,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 self._log_entries[prev_log_index].term
             entries = [entry_to_proto(e)
                        for e in self._log_entries[next_index:]]
+            self._last_append_request[id] = prev_log_index + len(entries)
             return raft_pb2.MsgAppendEntriesRequest(
                 term=self._cur_term, leaderId=self._id,
                 prevLogIndex=prev_log_index, prevLogTerm=prev_log_term,
@@ -283,9 +284,10 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 step_down = True
             elif self._role == self.LEADER:
                 if rsp.success:
-                    next_index = self._next_index.get(id, 0)
+                    last_sent = self._last_append_request.get(
+                        id, self._next_index.get(id, 0) - 1)
                     self._match_index[id] = max(
-                        self._match_index.get(id, -1), next_index - 1)
+                        self._match_index.get(id, -1), last_sent)
                     self._next_index[id] = self._match_index[id] + 1
                     advance = True
                 else:
