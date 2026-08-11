@@ -100,7 +100,8 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self._peers = list(peers) if peers is not None else []
         self._granted = 0
         self._election_timer = None
-        self._hb_timer = None
+        self._hb_thread = None
+        self._hb_stop_event = None
         self._leader_id = None
         # Leader only. next index of next log entry to send to a follower,
         # match index of the highest entry known to be replicated on follower.
@@ -205,9 +206,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         logging.info("I am the leader")
         print("I am leader")
         self._maybe_advance_commit()
-        self._hb_timer = threading.Timer(self.HB_TIME, self.heartbeat_nodes)
-        self._hb_timer.daemon = True
-        self._hb_timer.start()
+        self._start_heartbeat()
         self.send_append_entries_to_all()
 
     def _step_down(self, term: int):
@@ -220,10 +219,18 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self._stop_heartbeat()
         self.restart_election_timer()
 
+    def _start_heartbeat(self):
+        self._stop_heartbeat()
+        self._hb_stop_event = threading.Event()
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True,
+            name="heartbeat-{}".format(self._id))
+        self._hb_thread.start()
+
     def _stop_heartbeat(self):
-        if self._hb_timer is not None:
-            self._hb_timer.cancel()
-            self._hb_timer = None
+        if self._hb_stop_event is not None:
+            self._hb_stop_event.set()
+            self._hb_stop_event = None
 
     # ------------------------------------------------------------------
     # State machine apply
@@ -337,15 +344,18 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             peer.id, peer.ip, peer.port, msg)
         self.handle_snapshot_response(id, rsp, msg)
 
-    def heartbeat_nodes(self):
-        with self._lock:
-            if self._role != self.LEADER:
-                return
-        logging.debug("Node %s heart beating follower nodes", self._id)
-        self.send_append_entries_to_all()
-        self._hb_timer = threading.Timer(self.HB_TIME, self.heartbeat_nodes)
-        self._hb_timer.daemon = True
-        self._hb_timer.start()
+    def _heartbeat_loop(self):
+        stop_event = self._hb_stop_event
+        while stop_event is not None and not stop_event.wait(self.HB_TIME):
+            try:
+                with self._lock:
+                    if self._role != self.LEADER:
+                        return
+                logging.debug("Node %s heart beating follower nodes", self._id)
+                self.send_append_entries_to_all()
+            except Exception:
+                logging.exception(
+                    "Heartbeat loop iteration failed for node %s", self._id)
 
     @staticmethod
     def send_append_entries_message(id: str, ip: str, port: int,
