@@ -1,38 +1,68 @@
 import argparse
-import socket
+import json
+import sys
 
-AVAILABLE_COMMANDS = ("query_leader",)
+import grpc
+
+import raft_pb2
+import raft_pb2_grpc
+
+MAX_REDIRECTS = 5
+RPC_TIMEOUT = 5.0
 
 
-def query_leader(host, port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
-        s.sendall(b"CLIENT_COMMAND_REQUEST:-1\n")
-        print("Query sent")
-        data = s.recv(1024)
-        print('Received %s' % data)
-        _, leader_id, success = data.decode('UTF-8').split(":")
-        if not int(success):
-            print('No leader found')
-        else:
-            print('Leader is %s' % leader_id)
+def resolve_node(config, node_id):
+    entry = config.get(str(node_id))
+    if entry is None:
+        return None
+    return entry["ip"], entry["port"]
+
+
+def submit_command(host, port, op, data, config, config_path):
+    current = (host, port)
+    resp = None
+    for _ in range(MAX_REDIRECTS):
+        with grpc.insecure_channel(f"{current[0]}:{current[1]}") as channel:
+            stub = raft_pb2_grpc.RaftNodeStub(channel)
+            resp = stub.SubmitCommand(
+                raft_pb2.ClientCommandRequest(op=op, data=data),
+                timeout=RPC_TIMEOUT)
+        if resp.success or not resp.leaderId:
+            break
+        resolved = resolve_node(config, resp.leaderId)
+        if resolved is None:
+            print(f"leader {resp.leaderId!r} not found in {config_path}")
+            break
+        current = resolved
+    return resp
 
 
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser(
-        usage="Client.py <cmd> --host <host_ip> --port <port>",
-        description="praft client")
+    arg_parser = argparse.ArgumentParser(description="praft gRPC client")
     arg_parser.add_argument("command",
-                            help="command to execute"
-                            ",available command: query_leader")
+                            help="command to submit, e.g. 'set a:1'")
     arg_parser.add_argument("--host", default="localhost")
-    arg_parser.add_argument("--port", type=int, default=9996)
+    arg_parser.add_argument("--port", type=int, default=50051)
+    arg_parser.add_argument("--conf", default="config.json")
     args = arg_parser.parse_args()
-    print("Command: %s to host: %s:%s"
-          % (args.command, args.host, args.port))
-    if args.command == "query_leader":
-        query_leader(args.host, args.port)
-    else:
-        print("Unknown command, available commands: %s" \
-              % AVAILABLE_COMMANDS)
 
+    parts = args.command.split(None, 1)
+    op = parts[0]
+    data = parts[1] if len(parts) > 1 else ""
+
+    try:
+        with open(args.conf) as f:
+            config = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"failed to load {args.conf}: {e}")
+        sys.exit(1)
+
+    resp = submit_command(args.host, args.port, op, data, config, args.conf)
+    if resp.success:
+        print(f"OK: {op} {data} -> {resp.value}")
+    elif resp.leaderId:
+        print(f"Not leader, redirect to leader {resp.leaderId}")
+        sys.exit(2)
+    else:
+        print("Command failed: no leader available")
+        sys.exit(1)

@@ -3,6 +3,7 @@ syntax = "proto3";
 service RaftNode {
   rpc RequestVote(MsgVoteRequest) returns (MsgVoteResponse) {}
   rpc AppendEntries(MsgAppendEntriesRequest) returns (MsgAppendEntriesResponse) {}
+  rpc SubmitCommand(ClientCommandRequest) returns (ClientCommandResponse) {}
 }
 
 message MsgVoteRequest {
@@ -35,4 +36,15 @@ message MsgAppendEntriesRequest {
 message MsgAppendEntriesResponse {
   uint32 term = 1;
   bool success = 2;
+}
+
+message ClientCommandRequest {
+  string op = 1;
+  string data = 2;
+}
+
+message ClientCommandResponse {
+  bool success = 1;
+  string leaderId = 2;
+  string value = 3;
 }

@@ -7,6 +7,7 @@ from concurrent import futures
 
 import grpc
 
+import Client
 import Node
 import raft_pb2
 import raft_pb2_grpc
@@ -41,6 +42,15 @@ class RaftCluster:
                     return node
             time.sleep(0.1)
         return None
+
+    def address(self, i):
+        return "localhost", self._servers[i][1]
+
+    def config(self):
+        config = {"members": [str(i + 1) for i in range(len(self.nodes))]}
+        for i in range(len(self.nodes)):
+            config[str(i + 1)] = {"ip": "localhost", "port": self._servers[i][1]}
+        return config
 
     def stop(self):
         for node in self.nodes:
@@ -114,6 +124,35 @@ class SmokeTest(unittest.TestCase):
                                  "follower did not advance commit index")
                 self.assertEqual(node._state.get("a"), "1")
                 self.assertEqual(node._state.get("b"), "2")
+        finally:
+            cluster.stop()
+
+    def test_client_submit_command(self):
+        cluster = RaftCluster()
+        try:
+            leader = cluster.wait_for_leader()
+            self.assertIsNotNone(leader, "no leader elected in time")
+            config = cluster.config()
+
+            host, port = cluster.address(0)
+            resp = Client.submit_command(host, port, "set", "a:1", config,
+                                         "<test>")
+            self.assertTrue(resp.success,
+                            f"command failed with response: {resp}")
+            self.assertEqual(resp.value, "1")
+
+            deadline = time.monotonic() + REPLICATION_TIMEOUT
+            while time.monotonic() < deadline:
+                if all(n._state.get("a") == "1" and
+                       len(n._log_entries) == 1
+                       for n in cluster.nodes):
+                    break
+                time.sleep(0.1)
+            for node in cluster.nodes:
+                self.assertEqual(len(node._log_entries), 1)
+                self.assertEqual(node._log_entries[0].op, "set")
+                self.assertEqual(node._log_entries[0].data, "a:1")
+                self.assertEqual(node._state.get("a"), "1")
         finally:
             cluster.stop()
 

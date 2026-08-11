@@ -42,3 +42,23 @@ python Node.py --node 3 &
 Each node persists its term/vote/log in `data/NodeN.json` and logs to
 `log/NodeN.log`. Check each node's log to find out how leader is elected.
 
+### Submit commands from a client
+
+Once a leader is elected, submit commands through any node — the node
+redirects you to the leader if needed:
+
+```bash
+python Client.py "set a:1" --port 50051   # OK: set a:1 -> 1
+python Client.py "set b:2" --port 50052   # follows redirects to the leader
+```
+
+The client resolves the leader's address from `--conf config.json`
+(default). The command format is `<op> <data>`; `set` stores
+`key:value` pairs in the replicated state machine.
+
+### Tests
+
+```bash
+python -m unittest test_smoke   # election, replication, commit, client command
+```
+

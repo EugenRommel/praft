@@ -44,6 +44,11 @@ class RaftNodeStub:
                 request_serializer=raft__pb2.MsgAppendEntriesRequest.SerializeToString,
                 response_deserializer=raft__pb2.MsgAppendEntriesResponse.FromString,
                 _registered_method=True)
+        self.SubmitCommand = channel.unary_unary(
+                '/RaftNode/SubmitCommand',
+                request_serializer=raft__pb2.ClientCommandRequest.SerializeToString,
+                response_deserializer=raft__pb2.ClientCommandResponse.FromString,
+                _registered_method=True)
 
 
 class RaftNodeServicer:
@@ -61,6 +66,12 @@ class RaftNodeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubmitCommand(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RaftNodeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -73,6 +84,11 @@ def add_RaftNodeServicer_to_server(servicer, server):
                     servicer.AppendEntries,
                     request_deserializer=raft__pb2.MsgAppendEntriesRequest.FromString,
                     response_serializer=raft__pb2.MsgAppendEntriesResponse.SerializeToString,
+            ),
+            'SubmitCommand': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitCommand,
+                    request_deserializer=raft__pb2.ClientCommandRequest.FromString,
+                    response_serializer=raft__pb2.ClientCommandResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -129,6 +145,33 @@ class RaftNode:
             '/RaftNode/AppendEntries',
             raft__pb2.MsgAppendEntriesRequest.SerializeToString,
             raft__pb2.MsgAppendEntriesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitCommand(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/RaftNode/SubmitCommand',
+            raft__pb2.ClientCommandRequest.SerializeToString,
+            raft__pb2.ClientCommandResponse.FromString,
             options,
             channel_credentials,
             insecure,

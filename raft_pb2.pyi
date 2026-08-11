@@ -59,3 +59,21 @@ class MsgAppendEntriesResponse(_message.Message):
     term: int
     success: bool
     def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ...) -> None: ...
+
+class ClientCommandRequest(_message.Message):
+    __slots__ = ("op", "data")
+    OP_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    op: str
+    data: str
+    def __init__(self, op: _Optional[str] = ..., data: _Optional[str] = ...) -> None: ...
+
+class ClientCommandResponse(_message.Message):
+    __slots__ = ("success", "leaderId", "value")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    LEADERID_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    leaderId: str
+    value: str
+    def __init__(self, success: _Optional[bool] = ..., leaderId: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...

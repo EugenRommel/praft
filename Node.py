@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import grpc
 import json
@@ -74,6 +75,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     ELECTION_TIME_LOW = 4 * HB_TIME
     ELECTION_TIME_HIGH = 8 * HB_TIME
     RPC_TIMEOUT = 1.0
+    COMMIT_TIMEOUT = 5.0
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
 
@@ -454,6 +456,33 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                                          len(self._log_entries) - 1)
             self._apply_committed()
         return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=True)
+
+    def SubmitCommand(self, request: raft_pb2.ClientCommandRequest, context):
+        with self._lock:
+            if self._role != self.LEADER:
+                return raft_pb2.ClientCommandResponse(
+                    success=False, leaderId=self._leader_id or "")
+            entry = Entry(term=self._cur_term, op=request.op, data=request.data)
+            self._log_entries.append(entry)
+            self.persist_entries()
+            target_index = len(self._log_entries) - 1
+        self._maybe_advance_commit()
+        self.send_append_entries_to_all()
+        deadline = time.monotonic() + self.COMMIT_TIMEOUT
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._role != self.LEADER:
+                    return raft_pb2.ClientCommandResponse(
+                        success=False, leaderId=self._leader_id or "")
+                if self._commit_index >= target_index:
+                    key, _, _ = entry.data.partition(":")
+                    return raft_pb2.ClientCommandResponse(
+                        success=True, leaderId=self._id,
+                        value=self._state.get(key, ""))
+            time.sleep(0.05)
+        logging.warning("Node %s timed out waiting for commit of entry %s",
+                        self._id, entry)
+        return raft_pb2.ClientCommandResponse(success=False, leaderId=self._id)
 
 
 def serve(port, node_id, neighbors, cur_term=0, entries=None):
