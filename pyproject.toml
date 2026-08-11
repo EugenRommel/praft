@@ -1,0 +1,14 @@
+[project]
+name = "praft"
+version = "0.1.0"
+description = "Raft consensus algorithm demo implemented in Python (gRPC)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio==1.83.0",
+    "grpcio-tools==1.83.0",
+    "protobuf==7.35.1",
+]
+
+[tool.uv]
+package = false

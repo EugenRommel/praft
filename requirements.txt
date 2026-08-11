@@ -1,0 +1,6 @@
+# praft runtime + tooling dependencies.
+# Install with uv:  uv pip install -r requirements.txt
+# or via pyproject.toml: uv sync
+grpcio==1.83.0
+grpcio-tools==1.83.0
+protobuf==7.35.1

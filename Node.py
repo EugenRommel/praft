@@ -28,6 +28,17 @@ class Entry:
     def __repr__(self):
         return "{}:{}:{}".format(self.term, self.op, self.data)
 
+    def to_dict(self):
+        return {"term": self.term, "op": self.op, "data": self.data}
+
+    @staticmethod
+    def from_dict(d):
+        return Entry(d["term"], d["op"], d["data"])
+
+
+def entry_to_proto(entry: Entry) -> raft_pb2.Entry:
+    return raft_pb2.Entry(key=entry.op, val=int(entry.data))
+
 
 class NodeStatus:
     def __init__(self, id, ip, port, health='healthy'):
@@ -94,16 +105,24 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self._data_content = {}
         try:
             with open(self._data_file) as f:
-                self._data_content = json.load(f)
-        except FileNotFoundError:
-            self._data_content['term'] = self._cur_term
-            with open(self._data_file, 'w+') as f:
-                json.dump(self._data_file, f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self._data_content = loaded
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        if "term" in self._data_content:
+            self._cur_term = self._data_content["term"]
+        if "vote_for" in self._data_content:
+            self._vote_for = self._data_content["vote_for"]
+        if "entries" in self._data_content:
+            self._log_entries = [Entry.from_dict(e)
+                                 for e in self._data_content["entries"]]
+        self.persist_term_and_vote()
 
     def heartbeat_nodes(self):
         prev_log_index = len(self._log_entries) - 1
         prev_log_term = \
-            0 if prev_log_index else self._log_entries[prev_log_index].term
+            0 if prev_log_index < 0 else self._log_entries[prev_log_index].term
         rpc = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id, prevLogIndex=prev_log_index,
                                                prevLogTerm=prev_log_term, leaderCommit=self._commit_index,
                                                entries=[])
@@ -118,12 +137,13 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     def persist_term_and_vote(self):
         self._data_content['term'] = self._cur_term
         self._data_content['vote_for'] = self._vote_for
-        with open(self._data_file, 'w+') as out:
+        with open(self._data_file, 'w') as out:
             json.dump(self._data_content, out)
 
     def persist_entries(self):
-        self._data_content['entries'] = self._log_entries
-        with open(self._data_file, 'w+') as out:
+        self._data_content['entries'] = [e.to_dict()
+                                         for e in self._log_entries]
+        with open(self._data_file, 'w') as out:
             json.dump(self._data_content, out)
 
     def leader_elect_timeout_handler(self):
@@ -166,22 +186,24 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     def handle_append_entries_response(self, id: str, rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
         while not rsp.success:
             prev_log_index = \
-                self._nodes_prev_index.getdefault(
+                self._nodes_prev_index.get(
                     id, len(self._log_entries) - 1) - 1
             if prev_log_index < -1:
                 prev_log_index = -1
-            prev_log_term = 0 if not self._log_entries else \
+            prev_log_term = 0 if prev_log_index < 0 else \
                 self._log_entries[prev_log_index].term
             self._nodes_prev_index[id] = prev_log_index
             rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term,
                                                        leaderId=self._id,
                                                        prevLogIndex=prev_log_index,
                                                        prevLogTerm=prev_log_term,
-                                                       entries=self._log_entries[prev_log_index:],
+                                                       entries=[entry_to_proto(e)
+                                                                for e in self._log_entries[prev_log_index + 1:]],
                                                        leaderCommit=self._commit_index)
             for peer in self._peers:
                 if peer.id == id:
-                    id_, resp_ = self.send_append_entries_message(id, peer.ip, peer.port, rpc_msg)
+                    _, rsp = self.send_append_entries_message(
+                        id, peer.ip, peer.port, rpc_msg)
                     break
 
     def send_append_entries_to_all(self, msg: raft_pb2.MsgAppendEntriesRequest) -> None:
@@ -202,7 +224,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 self._granted += 1
                 logging.debug("%s Granted me as leader", self._granted)
                 # Win election, change role to leader
-                if self._granted > len(self._peers) / 2:
+                if self._granted > (len(self._peers) + 1) / 2:
                     switch_to_leader = True
             if switch_to_leader:
                 with self._lock:
@@ -217,7 +239,9 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                         else self._log_entries[last_log_index].term
                 rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id,
                                                            prevLogIndex=last_log_index, prevLogTerm=last_log_term,
-                                                           entries=self._log_entries, leaderCommit=self._commit_index)
+                                                           entries=[entry_to_proto(e)
+                                                                    for e in self._log_entries[last_log_index + 1:]],
+                                                           leaderCommit=self._commit_index)
                 # Start heart beat timer
                 self._hb_timer = threading.Timer(self.HB_TIME,
                                                  self.heartbeat_nodes)
@@ -320,17 +344,17 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             self.persist_term_and_vote()
 
         my_last_log_index = len(self._log_entries) - 1
-        my_last_log_term = \
-            0 if my_last_log_index == -1 else self._log_entries[
-                my_last_log_index]
         prev_log_index_in_msg = request.prevLogIndex
         prev_log_term_in_msg = request.prevLogTerm
         if my_last_log_index < prev_log_index_in_msg:
             return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
-        if my_last_log_term != prev_log_term_in_msg:
-            self._log_entries = self._log_entries[:prev_log_index_in_msg]
+        if prev_log_index_in_msg >= 0 and \
+                self._log_entries[prev_log_index_in_msg].term != prev_log_term_in_msg:
+            return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
         if request.entries:
-            self._log_entries.extend(request.entries)
+            self._log_entries = self._log_entries[:prev_log_index_in_msg + 1]
+            self._log_entries.extend(
+                Entry(self._cur_term, e.key, e.val) for e in request.entries)
             self.persist_entries()
         with self._lock:
             if request.leaderCommit > self._commit_index:
@@ -338,7 +362,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=True)
 
 
-def serve(port, node_id, neighbors, cur_term, entries):
+def serve(port, node_id, neighbors, cur_term=0, entries=None):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     raft_pb2_grpc.add_RaftNodeServicer_to_server(
         RaftServicer(node_id, neighbors, cur_term, entries), server)
@@ -367,25 +391,12 @@ if __name__ == "__main__":
     node_port = config[args.node]['port']
     peers = [NodeStatus(n, config[n]['ip'], config[n]['port']) \
              for n in config['members'] if n != args.node]
-    term = 0
-    entries = []
 
-    data_dir = os.path.join(DATA_DIR, 'Node{}.json'.format(args.node))
     if not os.path.exists(DATA_DIR):
-        os.mkdir(DATA_DIR, 0o755)
-    with open(data_dir, 'w+') as f:
-        try:
-            data = json.load(f)
-            term = data['term']
-            entries = data['entries']
-        except:
-            data = {}
-            data['term'] = term
-            data['entries'] = entries
-            json.dump(data, f)
+        os.makedirs(DATA_DIR, 0o755, exist_ok=True)
 
     if not os.path.exists(LOG_DIR):
-        os.mkdir(LOG_DIR, 0o755)
+        os.makedirs(LOG_DIR, 0o755, exist_ok=True)
     log_dir = os.path.join(LOG_DIR, f'Node{args.node}.log')
     logging.basicConfig(
         handlers=[RotatingFileHandler(
@@ -396,4 +407,4 @@ if __name__ == "__main__":
 
     logging.info("Node run on %s:%s with id %s", node_ip, node_port, args.node)
     logging.info("Peer nodes: %s", peers)
-    serve(node_port, args.node, peers, term, entries)
+    serve(node_port, args.node, peers)
