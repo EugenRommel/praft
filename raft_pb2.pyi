@@ -77,3 +77,25 @@ class ClientCommandResponse(_message.Message):
     leaderId: str
     value: str
     def __init__(self, success: _Optional[bool] = ..., leaderId: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+
+class InstallSnapshotRequest(_message.Message):
+    __slots__ = ("term", "leaderId", "lastIncludedIndex", "lastIncludedTerm", "state")
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    LEADERID_FIELD_NUMBER: _ClassVar[int]
+    LASTINCLUDEDINDEX_FIELD_NUMBER: _ClassVar[int]
+    LASTINCLUDEDTERM_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    term: int
+    leaderId: str
+    lastIncludedIndex: int
+    lastIncludedTerm: int
+    state: bytes
+    def __init__(self, term: _Optional[int] = ..., leaderId: _Optional[str] = ..., lastIncludedIndex: _Optional[int] = ..., lastIncludedTerm: _Optional[int] = ..., state: _Optional[bytes] = ...) -> None: ...
+
+class InstallSnapshotResponse(_message.Message):
+    __slots__ = ("term", "success")
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    term: int
+    success: bool
+    def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ...) -> None: ...

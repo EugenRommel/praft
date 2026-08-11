@@ -4,6 +4,7 @@ service RaftNode {
   rpc RequestVote(MsgVoteRequest) returns (MsgVoteResponse) {}
   rpc AppendEntries(MsgAppendEntriesRequest) returns (MsgAppendEntriesResponse) {}
   rpc SubmitCommand(ClientCommandRequest) returns (ClientCommandResponse) {}
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse) {}
 }
 
 message MsgVoteRequest {
@@ -47,4 +48,17 @@ message ClientCommandResponse {
   bool success = 1;
   string leaderId = 2;
   string value = 3;
+}
+
+message InstallSnapshotRequest {
+  uint32 term = 1;
+  string leaderId = 2;
+  uint32 lastIncludedIndex = 3;
+  uint32 lastIncludedTerm = 4;
+  bytes state = 5;
+}
+
+message InstallSnapshotResponse {
+  uint32 term = 1;
+  bool success = 2;
 }

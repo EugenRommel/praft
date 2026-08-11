@@ -56,9 +56,18 @@ The client resolves the leader's address from `--conf config.json`
 (default). The command format is `<op> <data>`; `set` stores
 `key:value` pairs in the replicated state machine.
 
+### Log compaction / snapshots
+
+Leaders snapshot the state machine once `commit_index` advances past the
+snapshot threshold (`SNAPSHOT_THRESHOLD` in `Node.py`, default 10000
+entries). Compacted log prefixes are replaced by a snapshot (last included
+index/term + serialized state) persisted in `data/NodeN.json`. A follower
+that falls behind the compaction point is brought up to date with the
+`InstallSnapshot` RPC instead of replaying the log.
+
 ### Tests
 
 ```bash
-python -m unittest test_smoke   # election, replication, commit, client command
+python -m unittest test_smoke   # election, replication, commit, client command, snapshots
 ```
 

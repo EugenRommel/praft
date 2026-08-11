@@ -76,6 +76,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     ELECTION_TIME_HIGH = 8 * HB_TIME
     RPC_TIMEOUT = 1.0
     COMMIT_TIMEOUT = 5.0
+    SNAPSHOT_THRESHOLD = 10000
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
 
@@ -90,6 +91,12 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self._commit_index = -1
         self._last_applied = -1
         self._state = {}
+        # Snapshot: log entries before `_last_included_index` are replaced by
+        # the snapshot. The first entry in `_log_entries` is at index
+        # `_last_included_index + 1`.
+        self._last_included_index = -1
+        self._last_included_term = 0
+        self._snapshot_state = {}
         self._peers = list(peers) if peers is not None else []
         self._granted = 0
         self._election_timer = None
@@ -117,6 +124,16 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         if "entries" in self._data_content:
             self._log_entries = [Entry.from_dict(e)
                                  for e in self._data_content["entries"]]
+        if "snapshot" in self._data_content:
+            snap = self._data_content["snapshot"]
+            self._last_included_index = snap["lastIncludedIndex"]
+            self._last_included_term = snap["lastIncludedTerm"]
+            self._snapshot_state = dict(snap.get("state", {}))
+            self._state = dict(self._snapshot_state)
+            if self._last_included_index > self._commit_index:
+                self._commit_index = self._last_included_index
+            if self._last_included_index > self._last_applied:
+                self._last_applied = self._last_included_index
         self.persist_term_and_vote()
         self.restart_election_timer()
 
@@ -135,6 +152,41 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         with open(self._data_file, 'w') as out:
             json.dump(self._data_content, out)
 
+    def persist_snapshot(self):
+        self._data_content['entries'] = [e.to_dict()
+                                         for e in self._log_entries]
+        self._data_content['snapshot'] = {
+            'lastIncludedIndex': self._last_included_index,
+            'lastIncludedTerm': self._last_included_term,
+            'state': self._snapshot_state,
+        }
+        with open(self._data_file, 'w') as out:
+            json.dump(self._data_content, out)
+
+    # ------------------------------------------------------------------
+    # Log indexing (accounts for a snapshot prefix)
+    # ------------------------------------------------------------------
+    def first_index(self) -> int:
+        return self._last_included_index + 1
+
+    def last_index(self) -> int:
+        return self._last_included_index + len(self._log_entries)
+
+    def last_term(self) -> int:
+        if self._log_entries:
+            return self._log_entries[-1].term
+        return self._last_included_term
+
+    def entry_at(self, index: int) -> Entry:
+        return self._log_entries[index - self._last_included_index - 1]
+
+    def term_at(self, index: int) -> int:
+        if index < 0:
+            return 0
+        if index <= self._last_included_index:
+            return self._last_included_term
+        return self.entry_at(index).term
+
     # ------------------------------------------------------------------
     # Role transitions
     # ------------------------------------------------------------------
@@ -144,7 +196,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 return
             self._role = self.LEADER
             self._leader_id = self._id
-            last_log_index = len(self._log_entries) - 1
+            last_log_index = self.last_index()
             for p in self._peers:
                 self._next_index[p.id] = last_log_index + 1
                 self._match_index[p.id] = -1
@@ -185,18 +237,21 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         with self._lock:
             while self._last_applied < self._commit_index:
                 self._last_applied += 1
-                self._apply_entry(self._log_entries[self._last_applied])
+                if self._last_applied > self._last_included_index:
+                    self._apply_entry(self.entry_at(self._last_applied))
 
     def _maybe_advance_commit(self):
         with self._lock:
             if self._role != self.LEADER:
                 return
-            last_log_index = len(self._log_entries) - 1
-            if last_log_index <= self._commit_index:
+            last = self.last_index()
+            if last <= self._commit_index:
                 return
             majority = (len(self._peers) + 1) // 2
-            for n in range(last_log_index, self._commit_index, -1):
-                if self._log_entries[n].term != self._cur_term:
+            for n in range(last, self._commit_index, -1):
+                if n <= self._last_included_index:
+                    break
+                if self.term_at(n) != self._cur_term:
                     continue
                 matched = 1  # self
                 for p in self._peers:
@@ -206,25 +261,81 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                     self._commit_index = n
                     break
             self._apply_committed()
+            self._maybe_snapshot()
+
+    def _compact_log(self):
+        with self._lock:
+            if self._commit_index <= self._last_included_index:
+                return
+            index = self._commit_index
+            term = self.term_at(index)
+            drop = index - self._last_included_index
+            self._log_entries = self._log_entries[drop:]
+            self._last_included_index = index
+            self._last_included_term = term
+            self._snapshot_state = dict(self._state)
+            self.persist_snapshot()
+
+    def _maybe_snapshot(self):
+        with self._lock:
+            if self._role == self.LEADER and \
+                    self._commit_index - self._last_included_index >= \
+                    self.SNAPSHOT_THRESHOLD:
+                self._compact_log()
 
     # ------------------------------------------------------------------
     # Leader: heartbeats and log replication
     # ------------------------------------------------------------------
     def _append_entries_request(self, id: str) -> raft_pb2.MsgAppendEntriesRequest:
         with self._lock:
-            last_log_index = len(self._log_entries) - 1
-            next_index = min(self._next_index.get(id, last_log_index + 1),
-                             last_log_index + 1)
+            last = self.last_index()
+            next_index = min(self._next_index.get(id, last + 1), last + 1)
             prev_log_index = next_index - 1
-            prev_log_term = 0 if prev_log_index < 0 else \
-                self._log_entries[prev_log_index].term
+            prev_log_term = self.term_at(prev_log_index)
+            start = next_index - self.first_index()
+            if start < 0:
+                start = 0
             entries = [entry_to_proto(e)
-                       for e in self._log_entries[next_index:]]
+                       for e in self._log_entries[start:]]
             self._last_append_request[id] = prev_log_index + len(entries)
             return raft_pb2.MsgAppendEntriesRequest(
                 term=self._cur_term, leaderId=self._id,
                 prevLogIndex=prev_log_index, prevLogTerm=prev_log_term,
                 entries=entries, leaderCommit=self._commit_index)
+
+    def _needs_snapshot(self, id: str) -> bool:
+        with self._lock:
+            return self._next_index.get(id, self.last_index() + 1) <= \
+                self._last_included_index
+
+    def _snapshot_request(self) -> raft_pb2.InstallSnapshotRequest:
+        with self._lock:
+            return raft_pb2.InstallSnapshotRequest(
+                term=self._cur_term, leaderId=self._id,
+                lastIncludedIndex=self._last_included_index,
+                lastIncludedTerm=self._last_included_term,
+                state=json.dumps(self._snapshot_state).encode())
+
+    @staticmethod
+    def send_install_snapshot_message(
+            id: str, ip: str, port: int,
+            msg: raft_pb2.InstallSnapshotRequest) \
+            -> Tuple[str, raft_pb2.InstallSnapshotResponse]:
+        try:
+            with grpc.insecure_channel(f'{ip}:{port}') as channel:
+                stub = raft_pb2_grpc.RaftNodeStub(channel)
+                return id, stub.InstallSnapshot(
+                    msg, timeout=RaftServicer.RPC_TIMEOUT)
+        except Exception:
+            logging.warning("Failed to install snapshot to %s:%s", ip, port)
+            return id, None
+
+    def _send_snapshot_and_handle(
+            self, peer: NodeStatus,
+            msg: raft_pb2.InstallSnapshotRequest) -> None:
+        id, rsp = self.send_install_snapshot_message(
+            peer.id, peer.ip, peer.port, msg)
+        self.handle_snapshot_response(id, rsp, msg)
 
     def heartbeat_nodes(self):
         with self._lock:
@@ -258,9 +369,14 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             peers = list(self._peers)
         f_list = []
         for p in peers:
-            msg = self._append_entries_request(p.id)
-            f_list.append(self._rpc_executor.submit(
-                self._send_append_and_handle, p, msg))
+            if self._needs_snapshot(p.id):
+                msg = self._snapshot_request()
+                f_list.append(self._rpc_executor.submit(
+                    self._send_snapshot_and_handle, p, msg))
+            else:
+                msg = self._append_entries_request(p.id)
+                f_list.append(self._rpc_executor.submit(
+                    self._send_append_and_handle, p, msg))
         for f in futures.as_completed(f_list):
             try:
                 f.result()
@@ -271,8 +387,12 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         peer = next((p for p in self._peers if p.id == id), None)
         if peer is None:
             return
-        msg = self._append_entries_request(id)
-        self._rpc_executor.submit(self._send_append_and_handle, peer, msg)
+        if self._needs_snapshot(id):
+            msg = self._snapshot_request()
+            self._rpc_executor.submit(self._send_snapshot_and_handle, peer, msg)
+        else:
+            msg = self._append_entries_request(id)
+            self._rpc_executor.submit(self._send_append_and_handle, peer, msg)
 
     def handle_append_entries_response(self, id: str,
                                        rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
@@ -302,6 +422,27 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             self._maybe_advance_commit()
         elif retry:
             self._send_append_entries_to(id)
+
+    def handle_snapshot_response(self, id: str,
+                                 rsp: raft_pb2.InstallSnapshotResponse,
+                                 msg: raft_pb2.InstallSnapshotRequest) -> None:
+        if rsp is None:
+            return
+        step_down = False
+        advance = False
+        with self._lock:
+            if rsp.term > self._cur_term:
+                step_down = True
+            elif self._role == self.LEADER and rsp.success:
+                if self._next_index.get(id, 0) <= msg.lastIncludedIndex:
+                    self._match_index[id] = max(
+                        self._match_index.get(id, -1), msg.lastIncludedIndex)
+                    self._next_index[id] = self._match_index[id] + 1
+                    advance = True
+        if step_down:
+            self._step_down(rsp.term)
+        elif advance:
+            self._maybe_advance_commit()
 
     # ------------------------------------------------------------------
     # Election
@@ -358,9 +499,8 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     def send_request_vote(self):
         with self._lock:
             cur_term = self._cur_term
-            last_log_index = len(self._log_entries) - 1
-            last_log_term = self._log_entries[last_log_index].term \
-                if last_log_index >= 0 else 0
+            last_log_index = self.last_index()
+            last_log_term = self.last_term()
             peers = list(self._peers)
         rpc_message = raft_pb2.MsgVoteRequest(term=cur_term, candidateId=self._id,
                                               lastLogIndex=last_log_index,
@@ -404,8 +544,8 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 return resp
             if self._vote_for is not None and self._vote_for != request.candidateId:
                 return resp
-            term_in_log = self._log_entries[-1].term if self._log_entries else -1
-            last_log_index = len(self._log_entries) - 1
+            term_in_log = self.last_term()
+            last_log_index = self.last_index()
             up_to_date = (request.lastLogTerm > term_in_log or
                           (request.lastLogTerm == term_in_log and
                            request.lastLogIndex >= last_log_index))
@@ -438,22 +578,24 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         self.restart_election_timer()
 
         with self._lock:
-            my_last_log_index = len(self._log_entries) - 1
+            my_last_log_index = self.last_index()
             prev_log_index_in_msg = request.prevLogIndex
             prev_log_term_in_msg = request.prevLogTerm
             if my_last_log_index < prev_log_index_in_msg:
                 return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
-            if prev_log_index_in_msg >= 0 and \
-                    self._log_entries[prev_log_index_in_msg].term != prev_log_term_in_msg:
+            if prev_log_index_in_msg < self._last_included_index:
+                return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
+            if self.term_at(prev_log_index_in_msg) != prev_log_term_in_msg:
                 return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
             if len(request.entries) > 0:
-                self._log_entries = self._log_entries[:prev_log_index_in_msg + 1]
+                keep = prev_log_index_in_msg - self._last_included_index
+                self._log_entries = self._log_entries[:max(keep, 0)]
                 self._log_entries.extend(
                     Entry(e.term, e.op, e.data) for e in request.entries)
                 self.persist_entries()
             if request.leaderCommit > self._commit_index:
                 self._commit_index = min(request.leaderCommit,
-                                         len(self._log_entries) - 1)
+                                         self.last_index())
             self._apply_committed()
         return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=True)
 
@@ -465,7 +607,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             entry = Entry(term=self._cur_term, op=request.op, data=request.data)
             self._log_entries.append(entry)
             self.persist_entries()
-            target_index = len(self._log_entries) - 1
+            target_index = self.last_index()
         self._maybe_advance_commit()
         self.send_append_entries_to_all()
         deadline = time.monotonic() + self.COMMIT_TIMEOUT
@@ -483,6 +625,38 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         logging.warning("Node %s timed out waiting for commit of entry %s",
                         self._id, entry)
         return raft_pb2.ClientCommandResponse(success=False, leaderId=self._id)
+
+    def InstallSnapshot(self, request: raft_pb2.InstallSnapshotRequest,
+                        context):
+        logging.debug("Install snapshot request: %s", request)
+        if request.term < self._cur_term:
+            return raft_pb2.InstallSnapshotResponse(
+                term=self._cur_term, success=False)
+
+        with self._lock:
+            if request.term > self._cur_term:
+                self._cur_term = request.term
+                self._vote_for = None
+                self.persist_term_and_vote()
+            self._role = self.FOLLOWER
+            self._leader_id = request.leaderId
+            if request.lastIncludedIndex > self._last_included_index:
+                drop = request.lastIncludedIndex - self._last_included_index
+                self._log_entries = self._log_entries[drop:]
+                self._last_included_index = request.lastIncludedIndex
+                self._last_included_term = request.lastIncludedTerm
+                self._snapshot_state = json.loads(request.state.decode())
+                self._state = dict(self._snapshot_state)
+                if request.lastIncludedIndex > self._commit_index:
+                    self._commit_index = request.lastIncludedIndex
+                if request.lastIncludedIndex > self._last_applied:
+                    self._last_applied = request.lastIncludedIndex
+                self.persist_snapshot()
+                self.persist_entries()
+        self._stop_heartbeat()
+        self.restart_election_timer()
+        return raft_pb2.InstallSnapshotResponse(
+            term=self._cur_term, success=True)
 
 
 def serve(port, node_id, neighbors, cur_term=0, entries=None):

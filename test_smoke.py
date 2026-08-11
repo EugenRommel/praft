@@ -156,6 +156,120 @@ class SmokeTest(unittest.TestCase):
         finally:
             cluster.stop()
 
+    def test_snapshot_backfill(self):
+        cluster = RaftCluster()
+        try:
+            leader = cluster.wait_for_leader()
+            self.assertIsNotNone(leader, "no leader elected in time")
+            config = cluster.config()
+            host, port = cluster.address(0)
+
+            for i in range(5):
+                resp = Client.submit_command(host, port, "set", f"k{i}:v{i}",
+                                             config, "<test>")
+                self.assertTrue(resp.success, f"command failed: {resp}")
+
+            with leader._lock:
+                leader._compact_log()
+                self.assertEqual(leader._last_included_index,
+                                 leader._commit_index)
+                self.assertGreater(leader._last_included_index, 0)
+                self.assertEqual(len(leader._log_entries), 0)
+
+            server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+            port4 = server.add_insecure_port("[::]:0")
+            peers = [Node.NodeStatus(str(j + 1), "localhost",
+                                     cluster._servers[j][1])
+                     for j in range(3)]
+            node4 = Node.RaftServicer("4", peers)
+            raft_pb2_grpc.add_RaftNodeServicer_to_server(node4, server)
+            server.start()
+            node4._election_timer.cancel()
+            try:
+                with leader._lock:
+                    leader._peers.append(
+                        Node.NodeStatus("4", "localhost", port4))
+                    leader._next_index["4"] = 0
+                    leader._match_index["4"] = -1
+
+                leader.send_append_entries_to_all()
+
+                deadline = time.monotonic() + REPLICATION_TIMEOUT
+                while time.monotonic() < deadline:
+                    if node4._commit_index >= leader._commit_index and \
+                            node4._state == leader._state:
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(node4._commit_index, leader._commit_index,
+                                 "node4 did not install snapshot and catch up")
+                self.assertEqual(node4._state, leader._state)
+                self.assertEqual(node4._last_included_index,
+                                 leader._last_included_index)
+
+                resp = Client.submit_command(host, port, "set", "extra:1",
+                                             config, "<test>")
+                self.assertTrue(resp.success, f"command failed: {resp}")
+                deadline = time.monotonic() + REPLICATION_TIMEOUT
+                while time.monotonic() < deadline:
+                    if node4._state.get("extra") == "1":
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(node4._state.get("extra"), "1",
+                                 "node4 did not receive post-snapshot entries")
+            finally:
+                server.stop(0)
+        finally:
+            cluster.stop()
+
+    def test_snapshot_persistence_and_auto_compaction(self):
+        node = Node.RaftServicer("1", [])
+        try:
+            node._become_leader()
+            for key, val in (("a", "1"), ("b", "2"), ("c", "3")):
+                resp = node.SubmitCommand(
+                    raft_pb2.ClientCommandRequest(op="set", data=f"{key}:{val}"),
+                    None)
+                self.assertTrue(resp.success, resp)
+            with node._lock:
+                node._compact_log()
+                self.assertEqual(node._last_included_index, 2)
+                self.assertEqual(node._state,
+                                 {"a": "1", "b": "2", "c": "3"})
+                self.assertEqual(len(node._log_entries), 0)
+
+            node.SNAPSHOT_THRESHOLD = 2
+            resp = node.SubmitCommand(
+                raft_pb2.ClientCommandRequest(op="set", data="d:4"), None)
+            self.assertTrue(resp.success, resp)
+            with node._lock:
+                self.assertEqual(node._last_included_index, 2)
+            resp = node.SubmitCommand(
+                raft_pb2.ClientCommandRequest(op="set", data="e:5"), None)
+            self.assertTrue(resp.success, resp)
+            with node._lock:
+                self.assertEqual(node._last_included_index, 4,
+                                 "auto compaction did not trigger")
+                self.assertEqual(len(node._log_entries), 0)
+
+            node._stop_heartbeat()
+            node._election_timer.cancel()
+
+            reloaded = Node.RaftServicer("1", [])
+            try:
+                self.assertEqual(reloaded._state,
+                                 {"a": "1", "b": "2", "c": "3",
+                                  "d": "4", "e": "5"})
+                self.assertEqual(reloaded._last_included_index, 4)
+                self.assertEqual(reloaded._commit_index, 4)
+                self.assertEqual(len(reloaded._log_entries), 0)
+            finally:
+                reloaded._stop_heartbeat()
+                reloaded._election_timer.cancel()
+        finally:
+            node._stop_heartbeat()
+            if node._election_timer is not None:
+                node._election_timer.cancel()
+
 
 if __name__ == "__main__":
     unittest.main()

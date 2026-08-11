@@ -49,6 +49,11 @@ class RaftNodeStub:
                 request_serializer=raft__pb2.ClientCommandRequest.SerializeToString,
                 response_deserializer=raft__pb2.ClientCommandResponse.FromString,
                 _registered_method=True)
+        self.InstallSnapshot = channel.unary_unary(
+                '/RaftNode/InstallSnapshot',
+                request_serializer=raft__pb2.InstallSnapshotRequest.SerializeToString,
+                response_deserializer=raft__pb2.InstallSnapshotResponse.FromString,
+                _registered_method=True)
 
 
 class RaftNodeServicer:
@@ -72,6 +77,12 @@ class RaftNodeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def InstallSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RaftNodeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -89,6 +100,11 @@ def add_RaftNodeServicer_to_server(servicer, server):
                     servicer.SubmitCommand,
                     request_deserializer=raft__pb2.ClientCommandRequest.FromString,
                     response_serializer=raft__pb2.ClientCommandResponse.SerializeToString,
+            ),
+            'InstallSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.InstallSnapshot,
+                    request_deserializer=raft__pb2.InstallSnapshotRequest.FromString,
+                    response_serializer=raft__pb2.InstallSnapshotResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -172,6 +188,33 @@ class RaftNode:
             '/RaftNode/SubmitCommand',
             raft__pb2.ClientCommandRequest.SerializeToString,
             raft__pb2.ClientCommandResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def InstallSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/RaftNode/InstallSnapshot',
+            raft__pb2.InstallSnapshotRequest.SerializeToString,
+            raft__pb2.InstallSnapshotResponse.FromString,
             options,
             channel_credentials,
             insecure,
