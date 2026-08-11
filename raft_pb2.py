@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nraft.proto\"^\n\x0eMsgVoteRequest\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x13\n\x0b\x63\x61ndidateId\x18\x02 \x01(\t\x12\x14\n\x0clastLogIndex\x18\x03 \x01(\x05\x12\x13\n\x0blastLogTerm\x18\x05 \x01(\r\"4\n\x0fMsgVoteResponse\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x13\n\x0bvoteGranted\x18\x02 \x01(\x08\"!\n\x05\x45ntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x0b\n\x03val\x18\x02 \x01(\x05\"\x93\x01\n\x17MsgAppendEntriesRequest\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x10\n\x08leaderId\x18\x02 \x01(\t\x12\x14\n\x0cprevLogIndex\x18\x03 \x01(\x05\x12\x13\n\x0bprevLogTerm\x18\x04 \x01(\r\x12\x14\n\x0cleaderCommit\x18\x05 \x01(\r\x12\x17\n\x07\x65ntries\x18\x06 \x03(\x0b\x32\x06.Entry\"9\n\x18MsgAppendEntriesResponse\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x0f\n\x07success\x18\x02 \x01(\x08\x32\x86\x01\n\x08RaftNode\x12\x32\n\x0bRequestVote\x12\x0f.MsgVoteRequest\x1a\x10.MsgVoteResponse\"\x00\x12\x46\n\rAppendEntries\x12\x18.MsgAppendEntriesRequest\x1a\x19.MsgAppendEntriesResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nraft.proto\"^\n\x0eMsgVoteRequest\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x13\n\x0b\x63\x61ndidateId\x18\x02 \x01(\t\x12\x14\n\x0clastLogIndex\x18\x03 \x01(\x05\x12\x13\n\x0blastLogTerm\x18\x05 \x01(\r\"4\n\x0fMsgVoteResponse\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x13\n\x0bvoteGranted\x18\x02 \x01(\x08\"/\n\x05\x45ntry\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\n\n\x02op\x18\x02 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\t\"\x93\x01\n\x17MsgAppendEntriesRequest\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x10\n\x08leaderId\x18\x02 \x01(\t\x12\x14\n\x0cprevLogIndex\x18\x03 \x01(\x05\x12\x13\n\x0bprevLogTerm\x18\x04 \x01(\r\x12\x14\n\x0cleaderCommit\x18\x05 \x01(\x05\x12\x17\n\x07\x65ntries\x18\x06 \x03(\x0b\x32\x06.Entry\"9\n\x18MsgAppendEntriesResponse\x12\x0c\n\x04term\x18\x01 \x01(\r\x12\x0f\n\x07success\x18\x02 \x01(\x08\x32\x86\x01\n\x08RaftNode\x12\x32\n\x0bRequestVote\x12\x0f.MsgVoteRequest\x1a\x10.MsgVoteResponse\"\x00\x12\x46\n\rAppendEntries\x12\x18.MsgAppendEntriesRequest\x1a\x19.MsgAppendEntriesResponse\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,11 +36,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_MSGVOTERESPONSE']._serialized_start=110
   _globals['_MSGVOTERESPONSE']._serialized_end=162
   _globals['_ENTRY']._serialized_start=164
-  _globals['_ENTRY']._serialized_end=197
-  _globals['_MSGAPPENDENTRIESREQUEST']._serialized_start=200
-  _globals['_MSGAPPENDENTRIESREQUEST']._serialized_end=347
-  _globals['_MSGAPPENDENTRIESRESPONSE']._serialized_start=349
-  _globals['_MSGAPPENDENTRIESRESPONSE']._serialized_end=406
-  _globals['_RAFTNODE']._serialized_start=409
-  _globals['_RAFTNODE']._serialized_end=543
+  _globals['_ENTRY']._serialized_end=211
+  _globals['_MSGAPPENDENTRIESREQUEST']._serialized_start=214
+  _globals['_MSGAPPENDENTRIESREQUEST']._serialized_end=361
+  _globals['_MSGAPPENDENTRIESRESPONSE']._serialized_start=363
+  _globals['_MSGAPPENDENTRIESRESPONSE']._serialized_end=420
+  _globals['_RAFTNODE']._serialized_start=423
+  _globals['_RAFTNODE']._serialized_end=557
 # @@protoc_insertion_point(module_scope)

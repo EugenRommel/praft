@@ -18,8 +18,9 @@ message MsgVoteResponse {
 }
 
 message Entry {
-  string key = 1;
-  int32 val = 2;
+  uint32 term = 1;
+  string op = 2;
+  string data = 3;
 }
 
 message MsgAppendEntriesRequest {
@@ -27,7 +28,7 @@ message MsgAppendEntriesRequest {
   string leaderId = 2;
   int32 prevLogIndex = 3;
   uint32 prevLogTerm = 4;
-  uint32 leaderCommit = 5;
+  int32 leaderCommit = 5;
   repeated Entry entries = 6;
 }
 

@@ -37,7 +37,7 @@ class Entry:
 
 
 def entry_to_proto(entry: Entry) -> raft_pb2.Entry:
-    return raft_pb2.Entry(key=entry.op, val=int(entry.data))
+    return raft_pb2.Entry(term=entry.term, op=entry.op, data=str(entry.data))
 
 
 class NodeStatus:
@@ -73,34 +73,32 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     HB_TIME = 1
     ELECTION_TIME_LOW = 4 * HB_TIME
     ELECTION_TIME_HIGH = 8 * HB_TIME
+    RPC_TIMEOUT = 1.0
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
 
     def __init__(self, node_id: str, peers: list[NodeStatus] = None,
                  cur_term: int = 0, log_entries: list[Entry] = None) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._role = self.FOLLOWER
         self._cur_term = cur_term
         self._id = node_id
         self._vote_for = None
-        if log_entries is None:
-            self._log_entries = []
-        else:
-            self._log_entries = log_entries
-        self._commit_index = 0
+        self._log_entries = list(log_entries) if log_entries is not None else []
+        self._commit_index = -1
         self._last_applied = -1
-        self._peers = peers
+        self._state = {}
+        self._peers = list(peers) if peers is not None else []
         self._granted = 0
-        self._election_timer = threading.Timer(
-            random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
-            self.leader_elect_timeout_handler)
-        self._election_timer.start()
+        self._election_timer = None
         self._hb_timer = None
-        # it will not be empty if this node is leader. key is node id and value
-        # is prev_index
-        self._nodes_prev_index = {}
-        # leader id
         self._leader_id = None
+        # Leader only. next index of next log entry to send to a follower,
+        # match index of the highest entry known to be replicated on follower.
+        self._next_index = {}
+        self._match_index = {}
+        self._last_append_request = {}
+        self._rpc_executor = futures.ThreadPoolExecutor(max_workers=8)
         self._data_file = os.path.join(DATA_DIR, "Node{}.json".format(node_id))
         self._data_content = {}
         try:
@@ -118,22 +116,11 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
             self._log_entries = [Entry.from_dict(e)
                                  for e in self._data_content["entries"]]
         self.persist_term_and_vote()
+        self.restart_election_timer()
 
-    def heartbeat_nodes(self):
-        prev_log_index = len(self._log_entries) - 1
-        prev_log_term = \
-            0 if prev_log_index < 0 else self._log_entries[prev_log_index].term
-        rpc = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id, prevLogIndex=prev_log_index,
-                                               prevLogTerm=prev_log_term, leaderCommit=self._commit_index,
-                                               entries=[])
-        self.send_append_entries_to_all(rpc)
-        logging.info("Node %s heart beating follower nodes: %s",
-                     self._id, rpc)
-        # Start heart beat timer
-        self._hb_timer = threading.Timer(self.HB_TIME,
-                                         self.heartbeat_nodes)
-        self._hb_timer.start()
-
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
     def persist_term_and_vote(self):
         self._data_content['term'] = self._cur_term
         self._data_content['vote_for'] = self._vote_for
@@ -146,219 +133,324 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         with open(self._data_file, 'w') as out:
             json.dump(self._data_content, out)
 
+    # ------------------------------------------------------------------
+    # Role transitions
+    # ------------------------------------------------------------------
+    def _become_leader(self):
+        with self._lock:
+            if self._role == self.LEADER:
+                return
+            self._role = self.LEADER
+            self._leader_id = self._id
+            last_log_index = len(self._log_entries) - 1
+            for p in self._peers:
+                self._next_index[p.id] = last_log_index + 1
+                self._match_index[p.id] = -1
+        if self._election_timer is not None:
+            self._election_timer.cancel()
+        logging.info("I am the leader")
+        print("I am leader")
+        self._maybe_advance_commit()
+        self._hb_timer = threading.Timer(self.HB_TIME, self.heartbeat_nodes)
+        self._hb_timer.daemon = True
+        self._hb_timer.start()
+        self.send_append_entries_to_all()
+
+    def _step_down(self, term: int):
+        with self._lock:
+            self._role = self.FOLLOWER
+            self._cur_term = term
+            self._vote_for = None
+            self._granted = 0
+            self.persist_term_and_vote()
+        self._stop_heartbeat()
+        self.restart_election_timer()
+
+    def _stop_heartbeat(self):
+        if self._hb_timer is not None:
+            self._hb_timer.cancel()
+            self._hb_timer = None
+
+    # ------------------------------------------------------------------
+    # State machine apply
+    # ------------------------------------------------------------------
+    def _apply_entry(self, entry: Entry):
+        if entry.op == "set":
+            key, _, value = entry.data.partition(":")
+            self._state[key] = value
+
+    def _apply_committed(self):
+        with self._lock:
+            while self._last_applied < self._commit_index:
+                self._last_applied += 1
+                self._apply_entry(self._log_entries[self._last_applied])
+
+    def _maybe_advance_commit(self):
+        with self._lock:
+            if self._role != self.LEADER:
+                return
+            last_log_index = len(self._log_entries) - 1
+            if last_log_index <= self._commit_index:
+                return
+            majority = (len(self._peers) + 1) // 2
+            for n in range(last_log_index, self._commit_index, -1):
+                if self._log_entries[n].term != self._cur_term:
+                    continue
+                matched = 1  # self
+                for p in self._peers:
+                    if self._match_index.get(p.id, -1) >= n:
+                        matched += 1
+                if matched > majority:
+                    self._commit_index = n
+                    break
+            self._apply_committed()
+
+    # ------------------------------------------------------------------
+    # Leader: heartbeats and log replication
+    # ------------------------------------------------------------------
+    def _append_entries_request(self, id: str) -> raft_pb2.MsgAppendEntriesRequest:
+        with self._lock:
+            last_log_index = len(self._log_entries) - 1
+            next_index = min(self._next_index.get(id, last_log_index + 1),
+                             last_log_index + 1)
+            prev_log_index = next_index - 1
+            prev_log_term = 0 if prev_log_index < 0 else \
+                self._log_entries[prev_log_index].term
+            entries = [entry_to_proto(e)
+                       for e in self._log_entries[next_index:]]
+            return raft_pb2.MsgAppendEntriesRequest(
+                term=self._cur_term, leaderId=self._id,
+                prevLogIndex=prev_log_index, prevLogTerm=prev_log_term,
+                entries=entries, leaderCommit=self._commit_index)
+
+    def heartbeat_nodes(self):
+        with self._lock:
+            if self._role != self.LEADER:
+                return
+        logging.debug("Node %s heart beating follower nodes", self._id)
+        self.send_append_entries_to_all()
+        self._hb_timer = threading.Timer(self.HB_TIME, self.heartbeat_nodes)
+        self._hb_timer.daemon = True
+        self._hb_timer.start()
+
+    @staticmethod
+    def send_append_entries_message(id: str, ip: str, port: int,
+                                    msg: raft_pb2.MsgAppendEntriesRequest) \
+            -> Tuple[str, raft_pb2.MsgAppendEntriesResponse]:
+        try:
+            with grpc.insecure_channel(f'{ip}:{port}') as channel:
+                stub = raft_pb2_grpc.RaftNodeStub(channel)
+                return id, stub.AppendEntries(msg, timeout=RaftServicer.RPC_TIMEOUT)
+        except Exception:
+            logging.warning("Failed to send append entries to %s:%s", ip, port)
+            return id, None
+
+    def _send_append_and_handle(self, peer: NodeStatus,
+                                msg: raft_pb2.MsgAppendEntriesRequest) -> None:
+        id, rsp = self.send_append_entries_message(peer.id, peer.ip, peer.port, msg)
+        self.handle_append_entries_response(id, rsp)
+
+    def send_append_entries_to_all(self) -> None:
+        with self._lock:
+            peers = list(self._peers)
+        f_list = []
+        for p in peers:
+            msg = self._append_entries_request(p.id)
+            f_list.append(self._rpc_executor.submit(
+                self._send_append_and_handle, p, msg))
+        for f in futures.as_completed(f_list):
+            try:
+                f.result()
+            except Exception:
+                continue
+
+    def _send_append_entries_to(self, id: str) -> None:
+        peer = next((p for p in self._peers if p.id == id), None)
+        if peer is None:
+            return
+        msg = self._append_entries_request(id)
+        self._rpc_executor.submit(self._send_append_and_handle, peer, msg)
+
+    def handle_append_entries_response(self, id: str,
+                                       rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
+        if rsp is None:
+            return
+        step_down = False
+        retry = False
+        advance = False
+        with self._lock:
+            if rsp.term > self._cur_term:
+                step_down = True
+            elif self._role == self.LEADER:
+                if rsp.success:
+                    next_index = self._next_index.get(id, 0)
+                    self._match_index[id] = max(
+                        self._match_index.get(id, -1), next_index - 1)
+                    self._next_index[id] = self._match_index[id] + 1
+                    advance = True
+                else:
+                    if self._next_index.get(id, 0) > 0:
+                        self._next_index[id] = self._next_index.get(id, 0) - 1
+                        retry = True
+        if step_down:
+            self._step_down(rsp.term)
+        elif advance:
+            self._maybe_advance_commit()
+        elif retry:
+            self._send_append_entries_to(id)
+
+    # ------------------------------------------------------------------
+    # Election
+    # ------------------------------------------------------------------
     def leader_elect_timeout_handler(self):
         with self._lock:
             if self._role == self.LEADER:
-                logging.debug("I am leader, exit")
                 return
-
-        logging.info("Start a new vote cycle for term: %s",
-                     self._cur_term)
-        with self._lock:
             self._role = self.CANDIDATE
             self._vote_for = None
             self._granted = 0
             self._cur_term += 1
             self.persist_term_and_vote()
+        logging.info("Start a new vote cycle for term: %s", self._cur_term)
         self.send_request_vote()
         self.restart_election_timer()
 
     def restart_election_timer(self):
-        logging.info("Restart election timer")
-        self._election_timer.cancel()
+        logging.debug("Restart election timer")
+        if self._election_timer is not None:
+            self._election_timer.cancel()
         self._election_timer = threading.Timer(
             random.randint(self.ELECTION_TIME_LOW, self.ELECTION_TIME_HIGH),
             self.leader_elect_timeout_handler)
+        self._election_timer.daemon = True
         self._election_timer.start()
-
-    @staticmethod
-    def send_append_entries_message(id: str, ip: str, port: int, msg: raft_pb2.MsgAppendEntriesRequest) \
-            -> Tuple[str, raft_pb2.MsgAppendEntriesResponse]:
-        logging.debug('Send append entries %s to %s:%s', msg, ip, port)
-        while True:
-            try:
-                with grpc.insecure_channel(f'{ip}:{port}') as channel:
-                    stub = raft_pb2_grpc.RaftNodeStub(channel)
-                    return id, stub.AppendEntries(msg)
-            except:
-                logging.exception(f"Failed to send append entries message to {ip}:{port}, retry")
-
-    def handle_append_entries_response(self, id: str, rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
-        while not rsp.success:
-            prev_log_index = \
-                self._nodes_prev_index.get(
-                    id, len(self._log_entries) - 1) - 1
-            if prev_log_index < -1:
-                prev_log_index = -1
-            prev_log_term = 0 if prev_log_index < 0 else \
-                self._log_entries[prev_log_index].term
-            self._nodes_prev_index[id] = prev_log_index
-            rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term,
-                                                       leaderId=self._id,
-                                                       prevLogIndex=prev_log_index,
-                                                       prevLogTerm=prev_log_term,
-                                                       entries=[entry_to_proto(e)
-                                                                for e in self._log_entries[prev_log_index + 1:]],
-                                                       leaderCommit=self._commit_index)
-            for peer in self._peers:
-                if peer.id == id:
-                    _, rsp = self.send_append_entries_message(
-                        id, peer.ip, peer.port, rpc_msg)
-                    break
-
-    def send_append_entries_to_all(self, msg: raft_pb2.MsgAppendEntriesRequest) -> None:
-        f_list = []
-        with futures.ThreadPoolExecutor(max_workers=4) as t:
-            for peer in self._peers:
-                logging.debug("Send AppendEntries to Node%s - %s:%s", peer.id, peer.ip, peer.port)
-                f = t.submit(self.send_append_entries_message, peer.id, peer.ip, peer.port, msg)
-                f_list.append(f)
-            for f in futures.as_completed(f_list):
-                id, resp = f.result()
-                self.handle_append_entries_response(id, resp)
-
-    def handle_vote_response(self, resp: raft_pb2.MsgVoteResponse) -> None:
-        if resp.voteGranted:
-            switch_to_leader = False
-            with self._lock:
-                self._granted += 1
-                logging.debug("%s Granted me as leader", self._granted)
-                # Win election, change role to leader
-                if self._granted > (len(self._peers) + 1) / 2:
-                    switch_to_leader = True
-            if switch_to_leader:
-                with self._lock:
-                    self._role = self.LEADER
-                    self._leader_id = self._id
-                logging.info("I am the leader")
-                print("I am leader")
-                # Start to send AppendEntriesRequest to peer nodes
-                last_log_index = len(self._log_entries) - 1
-                last_log_term = \
-                    0 if last_log_index == -1 \
-                        else self._log_entries[last_log_index].term
-                rpc_msg = raft_pb2.MsgAppendEntriesRequest(term=self._cur_term, leaderId=self._id,
-                                                           prevLogIndex=last_log_index, prevLogTerm=last_log_term,
-                                                           entries=[entry_to_proto(e)
-                                                                    for e in self._log_entries[last_log_index + 1:]],
-                                                           leaderCommit=self._commit_index)
-                # Start heart beat timer
-                self._hb_timer = threading.Timer(self.HB_TIME,
-                                                 self.heartbeat_nodes)
-                self._hb_timer.start()
-
-                # stop election timer
-                if self._election_timer:
-                    self._election_timer.cancel()
-                self.send_append_entries_to_all(rpc_msg)
-        else:
-            # update term with response term
-            if resp.term > self._cur_term:
-                with self._lock:
-                    self._cur_term = resp.term
 
     @staticmethod
     def send_request_vote_message(ip: str, port: int, msg: raft_pb2.MsgVoteRequest) \
             -> raft_pb2.MsgVoteResponse:
-        logging.info('Send request vote %s to %s:%s', msg, ip, port)
-        while True:
-            try:
-                with grpc.insecure_channel(f'{ip}:{port}') as channel:
-                    stub = raft_pb2_grpc.RaftNodeStub(channel)
-                    return stub.RequestVote(msg)
-            except:
-                logging.exception(f"Failed to send request vote message to {ip}:{port}, retry")
+        try:
+            with grpc.insecure_channel(f'{ip}:{port}') as channel:
+                stub = raft_pb2_grpc.RaftNodeStub(channel)
+                return stub.RequestVote(msg, timeout=RaftServicer.RPC_TIMEOUT)
+        except Exception:
+            logging.warning("Failed to send request vote to %s:%s", ip, port)
+            return None
 
     def send_request_vote_to_all(self, msg: raft_pb2.MsgVoteRequest) -> None:
-        # Grant myself at first
         with self._lock:
             if self._vote_for is None:
                 self._granted += 1
                 self._vote_for = self._id
-        f_list = []
-        with futures.ThreadPoolExecutor(max_workers=4) as t:
-            for peer in self._peers:
-                f = t.submit(self.send_request_vote_message, peer.ip, peer.port, msg)
-                f_list.append(f)
-            for f in futures.as_completed(f_list):
+            peers = list(self._peers)
+        f_list = [self._rpc_executor.submit(
+            self.send_request_vote_message, p.ip, p.port, msg) for p in peers]
+        for f in futures.as_completed(f_list):
+            try:
                 resp = f.result()
-                self.handle_vote_response(resp)
+            except Exception:
+                continue
+            self.handle_vote_response(resp)
 
     def send_request_vote(self):
-        last_log_index = len(self._log_entries) - 1
-        if last_log_index > -1:
-            last_log_term = self._log_entries[last_log_index].term
-        else:
-            last_log_term = 0
-        rpc_message = raft_pb2.MsgVoteRequest(term=self._cur_term, candidateId=self._id,
+        with self._lock:
+            cur_term = self._cur_term
+            last_log_index = len(self._log_entries) - 1
+            last_log_term = self._log_entries[last_log_index].term \
+                if last_log_index >= 0 else 0
+            peers = list(self._peers)
+        rpc_message = raft_pb2.MsgVoteRequest(term=cur_term, candidateId=self._id,
                                               lastLogIndex=last_log_index,
                                               lastLogTerm=last_log_term)
-        if not self._peers:
-            self._role = self.LEADER
+        if not peers:
+            self._become_leader()
         else:
             self.send_request_vote_to_all(rpc_message)
 
+    def handle_vote_response(self, resp: raft_pb2.MsgVoteResponse) -> None:
+        if resp is None:
+            return
+        win = False
+        with self._lock:
+            if resp.term > self._cur_term:
+                self._step_down(resp.term)
+                return
+            if resp.term != self._cur_term or self._role != self.CANDIDATE \
+                    or not resp.voteGranted:
+                return
+            self._granted += 1
+            logging.debug("%s granted me as leader", self._granted)
+            if self._granted > (len(self._peers) + 1) / 2:
+                win = True
+        if win:
+            self._become_leader()
+
+    # ------------------------------------------------------------------
+    # RPC handlers
+    # ------------------------------------------------------------------
     def RequestVote(self, request, context):
-        term_in_request = request.term
-        resp = raft_pb2.MsgVoteResponse(term=self._cur_term, voteGranted=False)
-        term_in_log = self._log_entries[-1].term if self._log_entries else -1
-        last_log_index = len(self._log_entries) - 1
         logging.info("Process vote request: %s", request)
-        if term_in_request >= self._cur_term:
-            if self._vote_for is None and \
-                    (request.lastLogTerm > term_in_log or
-                     (request.lastLogTerm == term_in_log and
-                      request.lastLogIndex >= last_log_index)):
-                resp.voteGranted = True
-                resp.term = term_in_request
-                self._vote_for = request.candidateId
-                self._cur_term = term_in_request
-                print("Vote for: %s, term_in_msg: %s, term_in_log: %s"
-                      ", index_in_msg: %s, last_log_index: %s" %
-                      (self._vote_for, term_in_request, term_in_log,
-                       request.lastLogIndex, last_log_index))
+        with self._lock:
+            if request.term > self._cur_term:
+                self._cur_term = request.term
+                self._vote_for = None
+                self._role = self.FOLLOWER
+                self.persist_term_and_vote()
+            resp = raft_pb2.MsgVoteResponse(term=self._cur_term, voteGranted=False)
+            if request.term < self._cur_term:
+                return resp
+            if self._vote_for is not None and self._vote_for != request.candidateId:
+                return resp
+            term_in_log = self._log_entries[-1].term if self._log_entries else -1
+            last_log_index = len(self._log_entries) - 1
+            up_to_date = (request.lastLogTerm > term_in_log or
+                          (request.lastLogTerm == term_in_log and
+                           request.lastLogIndex >= last_log_index))
+            if not up_to_date:
+                return resp
+            self._vote_for = request.candidateId
+            resp.voteGranted = True
+            self.persist_term_and_vote()
+        if resp.voteGranted:
+            self.restart_election_timer()
         return resp
 
     def AppendEntries(self, request: raft_pb2.MsgAppendEntriesRequest, context):
         logging.debug("Process append entries request: %s", request)
-        # Received AppendEntries means this node is follower
-        if self._hb_timer is not None:
-            self._hb_timer.cancel()
-            self._hb_timer = None
-        self.restart_election_timer()
-        # AppendEntriesRequest message fields:
-        # APPEND_ENTRY_REQUEST:leader_id:term:prev_log_index:
-        # prev_log_term:entries count:entry[0]...:commit_log_index
         term_in_msg = request.term
-        leader_id = int(request.leaderId)
         if term_in_msg < self._cur_term:
             logging.warning("Term in AppendEntriesRequest: %s  from %s"
-                            "< my own term: %s", term_in_msg, leader_id,
+                            "< my own term: %s", term_in_msg, request.leaderId,
                             self._cur_term)
             return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
 
         with self._lock:
+            if term_in_msg > self._cur_term:
+                self._cur_term = term_in_msg
+                self._vote_for = None
+                self.persist_term_and_vote()
             self._role = self.FOLLOWER
-            self._leader_id = leader_id
-            self._cur_term = term_in_msg
-            self.persist_term_and_vote()
+            self._leader_id = request.leaderId
+        self._stop_heartbeat()
+        self.restart_election_timer()
 
-        my_last_log_index = len(self._log_entries) - 1
-        prev_log_index_in_msg = request.prevLogIndex
-        prev_log_term_in_msg = request.prevLogTerm
-        if my_last_log_index < prev_log_index_in_msg:
-            return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
-        if prev_log_index_in_msg >= 0 and \
-                self._log_entries[prev_log_index_in_msg].term != prev_log_term_in_msg:
-            return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
-        if request.entries:
-            self._log_entries = self._log_entries[:prev_log_index_in_msg + 1]
-            self._log_entries.extend(
-                Entry(self._cur_term, e.key, e.val) for e in request.entries)
-            self.persist_entries()
         with self._lock:
+            my_last_log_index = len(self._log_entries) - 1
+            prev_log_index_in_msg = request.prevLogIndex
+            prev_log_term_in_msg = request.prevLogTerm
+            if my_last_log_index < prev_log_index_in_msg:
+                return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
+            if prev_log_index_in_msg >= 0 and \
+                    self._log_entries[prev_log_index_in_msg].term != prev_log_term_in_msg:
+                return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=False)
+            if len(request.entries) > 0:
+                self._log_entries = self._log_entries[:prev_log_index_in_msg + 1]
+                self._log_entries.extend(
+                    Entry(e.term, e.op, e.data) for e in request.entries)
+                self.persist_entries()
             if request.leaderCommit > self._commit_index:
-                self._commit_index = min(request.leaderCommit, len(self._log_entries) - 1)
+                self._commit_index = min(request.leaderCommit,
+                                         len(self._log_entries) - 1)
+            self._apply_committed()
         return raft_pb2.MsgAppendEntriesResponse(term=self._cur_term, success=True)
 
 

@@ -27,12 +27,14 @@ class MsgVoteResponse(_message.Message):
     def __init__(self, term: _Optional[int] = ..., voteGranted: _Optional[bool] = ...) -> None: ...
 
 class Entry(_message.Message):
-    __slots__ = ("key", "val")
-    KEY_FIELD_NUMBER: _ClassVar[int]
-    VAL_FIELD_NUMBER: _ClassVar[int]
-    key: str
-    val: int
-    def __init__(self, key: _Optional[str] = ..., val: _Optional[int] = ...) -> None: ...
+    __slots__ = ("term", "op", "data")
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    OP_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    term: int
+    op: str
+    data: str
+    def __init__(self, term: _Optional[int] = ..., op: _Optional[str] = ..., data: _Optional[str] = ...) -> None: ...
 
 class MsgAppendEntriesRequest(_message.Message):
     __slots__ = ("term", "leaderId", "prevLogIndex", "prevLogTerm", "leaderCommit", "entries")
