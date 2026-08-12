@@ -107,7 +107,7 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
         # match index of the highest entry known to be replicated on follower.
         self._next_index = {}
         self._match_index = {}
-        self._last_append_request = {}
+        self._append_in_flight = {}
         self._rpc_executor = futures.ThreadPoolExecutor(max_workers=8)
         self._data_file = os.path.join(DATA_DIR, "Node{}.json".format(node_id))
         self._data_content = {}
@@ -293,6 +293,20 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     # ------------------------------------------------------------------
     # Leader: heartbeats and log replication
     # ------------------------------------------------------------------
+    def _try_start_append(self, id: str) -> bool:
+        # At most one AppendEntries/InstallSnapshot may be in flight per
+        # peer so that responses cannot interleave and corrupt next/match
+        # index accounting.
+        with self._lock:
+            if self._append_in_flight.get(id, False):
+                return False
+            self._append_in_flight[id] = True
+            return True
+
+    def _end_append(self, id: str) -> None:
+        with self._lock:
+            self._append_in_flight[id] = False
+
     def _append_entries_request(self, id: str) -> raft_pb2.MsgAppendEntriesRequest:
         with self._lock:
             last = self.last_index()
@@ -304,7 +318,6 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 start = 0
             entries = [entry_to_proto(e)
                        for e in self._log_entries[start:]]
-            self._last_append_request[id] = prev_log_index + len(entries)
             return raft_pb2.MsgAppendEntriesRequest(
                 term=self._cur_term, leaderId=self._id,
                 prevLogIndex=prev_log_index, prevLogTerm=prev_log_term,
@@ -340,9 +353,13 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
     def _send_snapshot_and_handle(
             self, peer: NodeStatus,
             msg: raft_pb2.InstallSnapshotRequest) -> None:
-        id, rsp = self.send_install_snapshot_message(
-            peer.id, peer.ip, peer.port, msg)
-        self.handle_snapshot_response(id, rsp, msg)
+        try:
+            id, rsp = self.send_install_snapshot_message(
+                peer.id, peer.ip, peer.port, msg)
+        finally:
+            self._end_append(peer.id)
+        if rsp is not None:
+            self.handle_snapshot_response(id, rsp, msg)
 
     def _heartbeat_loop(self):
         stop_event = self._hb_stop_event
@@ -371,22 +388,31 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
 
     def _send_append_and_handle(self, peer: NodeStatus,
                                 msg: raft_pb2.MsgAppendEntriesRequest) -> None:
-        id, rsp = self.send_append_entries_message(peer.id, peer.ip, peer.port, msg)
-        self.handle_append_entries_response(id, rsp)
+        try:
+            id, rsp = self.send_append_entries_message(peer.id, peer.ip, peer.port, msg)
+        finally:
+            self._end_append(peer.id)
+        if rsp is not None:
+            last_sent = msg.prevLogIndex + len(msg.entries)
+            self.handle_append_entries_response(id, rsp, last_sent)
 
     def send_append_entries_to_all(self) -> None:
         with self._lock:
             peers = list(self._peers)
         f_list = []
         for p in peers:
-            if self._needs_snapshot(p.id):
-                msg = self._snapshot_request()
-                f_list.append(self._rpc_executor.submit(
-                    self._send_snapshot_and_handle, p, msg))
-            else:
-                msg = self._append_entries_request(p.id)
-                f_list.append(self._rpc_executor.submit(
-                    self._send_append_and_handle, p, msg))
+            if not self._try_start_append(p.id):
+                continue
+            try:
+                if self._needs_snapshot(p.id):
+                    f_list.append(self._rpc_executor.submit(
+                        self._send_snapshot_and_handle, p, self._snapshot_request()))
+                else:
+                    f_list.append(self._rpc_executor.submit(
+                        self._send_append_and_handle, p, self._append_entries_request(p.id)))
+            except Exception:
+                self._end_append(p.id)
+                raise
         for f in futures.as_completed(f_list):
             try:
                 f.result()
@@ -394,18 +420,26 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 continue
 
     def _send_append_entries_to(self, id: str) -> None:
+        if not self._try_start_append(id):
+            return
         peer = next((p for p in self._peers if p.id == id), None)
         if peer is None:
+            self._end_append(id)
             return
-        if self._needs_snapshot(id):
-            msg = self._snapshot_request()
-            self._rpc_executor.submit(self._send_snapshot_and_handle, peer, msg)
-        else:
-            msg = self._append_entries_request(id)
-            self._rpc_executor.submit(self._send_append_and_handle, peer, msg)
+        try:
+            if self._needs_snapshot(id):
+                self._rpc_executor.submit(
+                    self._send_snapshot_and_handle, peer, self._snapshot_request())
+            else:
+                self._rpc_executor.submit(
+                    self._send_append_and_handle, peer, self._append_entries_request(id))
+        except Exception:
+            self._end_append(id)
+            raise
 
     def handle_append_entries_response(self, id: str,
-                                       rsp: raft_pb2.MsgAppendEntriesResponse) -> None:
+                                       rsp: raft_pb2.MsgAppendEntriesResponse,
+                                       last_sent: int) -> None:
         if rsp is None:
             return
         step_down = False
@@ -416,15 +450,21 @@ class RaftServicer(raft_pb2_grpc.RaftNodeServicer):
                 step_down = True
             elif self._role == self.LEADER:
                 if rsp.success:
-                    last_sent = self._last_append_request.get(
-                        id, self._next_index.get(id, 0) - 1)
                     self._match_index[id] = max(
                         self._match_index.get(id, -1), last_sent)
                     self._next_index[id] = self._match_index[id] + 1
                     advance = True
                 else:
-                    if self._next_index.get(id, 0) > 0:
-                        self._next_index[id] = self._next_index.get(id, 0) - 1
+                    next_index = self._next_index.get(id, 0)
+                    floor = self._match_index.get(id, -1) + 1
+                    if next_index > floor:
+                        # Drop next_index exponentially toward the confirmed
+                        # frontier (match_index + 1) so a far-behind follower
+                        # converges in O(log N) round trips instead of one
+                        # decrement at a time.
+                        gap = next_index - floor
+                        self._next_index[id] = max(
+                            floor, next_index - max(1, gap // 2))
                         retry = True
         if step_down:
             self._step_down(rsp.term)
